@@ -7,6 +7,7 @@
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //more relay fixes wifi was marking relayed as true in some cases causing lora to not relay.
 //duty cycle checks working again. i broke it on last update.
+//orange lora messages are back.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -286,7 +287,9 @@ void cleanupTransmissionHistory() {
 }
 
 // --- Updated addMessage() to accept the recipient and only add private messages if intended ---
-void addMessage(const String& nodeId, const String& messageID, const String& sender, const String& recipient, String content, const String& source, const String& relayID, int rssi = 0, float snr = 0.0) {
+void addMessage(const String& nodeId, const String& messageID, const String& sender, 
+                const String& recipient, String content, const String& source, 
+                const String& relayID, int rssi = 0, float snr = 0.0) {
   const int maxMessageLength = 150;
   if (content.length() > maxMessageLength) {
     Serial.println("Message too long, truncating...");
@@ -294,8 +297,23 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
   }
 
   auto& status = messageTransmissions[messageID];
+
+  // If the message has already been added...
   if (status.addedToMessages) {
-    Serial.println("Message already exists, skipping...");
+    // Look for the existing message in the messages vector.
+    for (auto &msg : messages) {
+      if (msg.messageID == messageID) {
+        // If the new message is from LoRa but the stored one is not, update it.
+        if (source == "[LoRa]" && msg.source != "[LoRa]") {
+          Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
+          msg.source = "[LoRa]";
+          msg.rssi   = rssi;   // update RSSI
+          msg.snr    = snr;    // update SNR
+          msg.relayID = relayID; // optionally update relayID if needed
+        }
+        break;
+      }
+    }
     return;
   }
 
@@ -307,14 +325,14 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
   }
 
   String finalSource = "";
-  if (nodeId != getCustomNodeId(getNodeId())) {
+  if (nodeId != myId) {
     finalSource = source;
   }
 
   Message newMessage = {
     nodeId,
     sender,
-    recipient, // new field
+    recipient,
     content,
     finalSource,
     messageID,
@@ -324,16 +342,20 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
     millis()
   };
 
+  // Insert the new message at the beginning of the list.
   messages.insert(messages.begin(), newMessage);
   status.addedToMessages = true;
 
+  // Trim the messages vector if it exceeds our maximum.
   if (messages.size() > maxMessages) {
     messages.pop_back();
   }
 
   Serial.printf("Message added: NodeID: %s, Sender: %s, Recipient: %s, Content: %s, Source: %s, ID: %s, RelayID: %s\n",
-                nodeId.c_str(), sender.c_str(), recipient.c_str(), content.c_str(), finalSource.c_str(), messageID.c_str(), relayID.c_str());
+                nodeId.c_str(), sender.c_str(), recipient.c_str(), content.c_str(),
+                finalSource.c_str(), messageID.c_str(), relayID.c_str());
 }
+
 
 //
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
