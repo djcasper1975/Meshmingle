@@ -6,6 +6,7 @@
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //more relay fixes wifi was marking relayed as true in some cases causing lora to not relay.
+//duty cycle checks working again. i broke it on last update.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -61,6 +62,12 @@ uint64_t tx_time;
 uint64_t last_tx = 0;
 uint64_t minimum_pause = 0;
 unsigned long lastTransmitTime = 0;  
+
+// Timeout for pending transmissions (e.g. 5 minutes)
+const unsigned long pendingTxTimeout = 150000; // 300,000 ms = 2.5 minutes
+
+// Retain transmission history for 24 hours
+const unsigned long transmissionHistoryRetention = 86400000; // 86,400,000 ms = 24 hours
 
 // Instead of a single message buffer, we now use a queue for outgoing LoRa messages.
 std::vector<String> loraTransmissionQueue;
@@ -232,6 +239,46 @@ void cleanupIndirectNodes() {
     if (currentTime - it->second.lastSeen > timeout) {
       Serial.printf("[Indirect Nodes] Removing inactive indirect node: %s\n", it->first.c_str());
       it = indirectNodes.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void cleanupPendingTxQueue() {
+  unsigned long now = millis();
+  // Iterate over the queue in reverse order so we can remove items safely.
+  for (int i = loraTransmissionQueue.size() - 1; i >= 0; i--) {
+    String message = loraTransmissionQueue[i];
+    // Extract messageID from the message (assuming the format "messageID|...")
+    int separatorIndex = message.indexOf('|');
+    if (separatorIndex == -1) continue;
+    String messageID = message.substring(0, separatorIndex);
+    
+    // Look up the transmission status for this message
+    auto it = messageTransmissions.find(messageID);
+    if (it != messageTransmissions.end()) {
+      // Remove from queue if the message is already relayed...
+      // OR if it has been pending longer than pendingTxTimeout.
+      if (it->second.relayedViaLoRa || (now - it->second.timestamp > pendingTxTimeout)) {
+        Serial.printf("[Cleanup] Removing pending message %s from queue (stale or already relayed).\n", messageID.c_str());
+        loraTransmissionQueue.erase(loraTransmissionQueue.begin() + i);
+        // Reset the queued flag so that future scheduling is possible.
+        it->second.queuedForLoRa = false;
+      }
+    } else {
+      // If we have no record for this message, remove it.
+      loraTransmissionQueue.erase(loraTransmissionQueue.begin() + i);
+    }
+  }
+}
+
+void cleanupTransmissionHistory() {
+  unsigned long now = millis();
+  for (auto it = messageTransmissions.begin(); it != messageTransmissions.end(); ) {
+    if (now - it->second.timestamp > transmissionHistoryRetention) {
+      Serial.printf("[Cleanup] Removing transmission history for message %s (older than 24 hrs).\n", it->first.c_str());
+      it = messageTransmissions.erase(it);
     } else {
       ++it;
     }
@@ -565,14 +612,21 @@ void displayCarousel() {
 long lastTxTimeMillisVar = -1;
 
 void transmitWithDutyCycle(const String& message) {
+  // **** NEW DUTY CYCLE CHECK FOR ALL LORA TRANSMISSIONS ****
+  if (!isDutyCycleAllowed()) {
+    Serial.printf("[LoRa Tx] Duty cycle active. Delaying transmission for %llu ms.\n", minimum_pause);
+    loRaTransmitDelay = millis() + minimum_pause;
+    return;
+  }
+  // *********************************************************
+
   // Ensure that the scheduled LoRa delay has expired.
   if (millis() < loRaTransmitDelay) {
     Serial.println("[LoRa Tx] LoRa delay not expired, waiting...");
     return;
   }
 
-  // Check if the radio is busy with a timeout of 10 seconds.
-  // If radio.available() remains true for 10 seconds, force TX.
+  // Check if the radio is busy with a timeout of 5 seconds.
   static uint64_t rxCheckStart = 0;
   if (radio.available()) {
     if (rxCheckStart == 0) {
@@ -648,6 +702,7 @@ void transmitWithDutyCycle(const String& message) {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
   }
 }
+
 
 unsigned long lastHeartbeatTime = 0;
 const unsigned long firstHeartbeatDelay = 20000; // 20 seconds for first heartbeat
@@ -959,12 +1014,13 @@ void loop() {
   dnsServer.processNextRequest();
 
   // --- Cleanup: Remove old LoRa nodes, indirect nodes, and transmission statuses ---
-  if (millis() - lastCleanupTime >= cleanupInterval) {
-    cleanupLoRaNodes();          
-    cleanupIndirectNodes();  // <-- NEW: Clean up indirect nodes every 24 hours
-    // (Assume cleanup of messageTransmissions as needed)
-    lastCleanupTime = millis();
-  }
+if (millis() - lastCleanupTime >= cleanupInterval) {
+  cleanupLoRaNodes();          
+  cleanupIndirectNodes();  
+  cleanupPendingTxQueue();      // <-- New: Clean up pending TX messages
+  cleanupTransmissionHistory(); // <-- New: Clean up transmission history older than 24 hours
+  lastCleanupTime = millis();
+}
 
   if (millis() - lastHeartbeatTime >= heartbeatInterval) {
     sendHeartbeat();
