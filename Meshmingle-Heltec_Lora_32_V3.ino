@@ -7,7 +7,7 @@
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //more relay fixes wifi was marking relayed as true in some cases causing lora to not relay.
 //duty cycle checks working again. i broke it on last update.
-//orange lora messages are back.
+//green box that shoewed messages was updated to show rssi and snr of one of the relays. i missed parts out. i will rework on this another time.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -298,24 +298,30 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
 
   auto& status = messageTransmissions[messageID];
 
-  // If the message has already been added...
-  if (status.addedToMessages) {
-    // Look for the existing message in the messages vector.
-    for (auto &msg : messages) {
-      if (msg.messageID == messageID) {
-        // If the new message is from LoRa but the stored one is not, update it.
-        if (source == "[LoRa]" && msg.source != "[LoRa]") {
-          Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
-          msg.source = "[LoRa]";
-          msg.rssi   = rssi;   // update RSSI
-          msg.snr    = snr;    // update SNR
-          msg.relayID = relayID; // optionally update relayID if needed
-        }
+// If the message has already been added...
+if (status.addedToMessages) {
+  // Look for the existing message in the messages vector.
+  for (auto &msg : messages) {
+    if (msg.messageID == messageID) {
+      // Check if this message originates from our node.
+      String myId = getCustomNodeId(getNodeId());
+      if (msg.nodeId == myId) {
+        // Do not update the UI sent message with relay info.
         break;
       }
+      // Otherwise, if the new message is from LoRa but the stored one is not, update it.
+      if (source == "[LoRa]" && msg.source != "[LoRa]") {
+        Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
+        msg.source = "[LoRa]";
+        msg.rssi   = rssi;   // update RSSI
+        msg.snr    = snr;    // update SNR
+        msg.relayID = relayID; // optionally update relayID if needed
+      }
+      break;
     }
-    return;
   }
+  return;
+}
 
   // For private messages (recipient != "ALL") only add if this node is either the originator or the designated recipient.
   String myId = getCustomNodeId(getNodeId());
@@ -2320,3 +2326,4 @@ uint32_t getNodeId() {
 void initServer() {
   setupServerRoutes();
 }
+
