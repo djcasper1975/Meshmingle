@@ -1,16 +1,11 @@
-//Test v1.00.009
-//08-02-2025
+//Test v1.00.010
+//09-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//Indirect nodes show in nodelist and history.
-//lots of other back end tweeks to improve mesh relaying.
-//still struggling with noise on the frequency in my area causing loss of packets.
-//nodes did not relay if on the same subnet (wifi) now regardless of on same subnet messages are relayed.
-//still having issues at times with relay not happening and trying to work this out.
-//metrics page has updates.
+//more relay fixes wifi was marking relayed as true in some cases causing lora to not relay.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -34,13 +29,13 @@
 // ===================
 // TRANSMISSION TRACKING
 // ===================
-// Previously there was a single "relayed" flag; now we use separate flags for WiFi and LoRa.
 struct TransmissionStatus {
   bool transmittedViaWiFi = false;
   bool transmittedViaLoRa = false;
   bool addedToMessages = false;  // Flag to track if the message has been added to messages vector
   bool relayedViaWiFi = false;     // NEW: whether the message has been relayed via WiFi
   bool relayedViaLoRa = false;     // NEW: whether the message has been relayed via LoRa
+  bool queuedForLoRa = false;      // NEW: whether the message is already queued for LoRa transmission
   uint64_t timestamp = millis();   // record when the entry was created/updated
 };
 
@@ -340,14 +335,22 @@ void scheduleLoRaTransmission(String message) {
         return;
     }
 
+    // Check if this message is already queued for LoRa transmission.
+    auto& status = messageTransmissions[messageID];
+    if (status.queuedForLoRa) {
+      Serial.println("[LoRa Schedule] Message already queued for LoRa, skipping...");
+      return;
+    }
+
     // Check if this node is the originator or a relay
     if (originatorID != myId) {
         // This node is relaying someone else's message.
         String newRelayID = myId;
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
-        // Instead of overwriting a single fullMessage, push it onto the queue.
         loraTransmissionQueue.push_back(updatedMessage);
+        status.queuedForLoRa = true;
         if (loraTransmissionQueue.size() == 1) {
+          // Use a random delay to avoid collisions when relaying others' messages.
           loRaTransmitDelay = millis() + random(1201, 5000);
         }
         Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
@@ -355,11 +358,13 @@ void scheduleLoRaTransmission(String message) {
     } else {
         // This is the originator. Schedule the original message for transmission.
         loraTransmissionQueue.push_back(message);
+        status.queuedForLoRa = true;
         if (loraTransmissionQueue.size() == 1) {
-          loRaTransmitDelay = millis() + random(1201, 5000);
+          // For originated messages, we want immediate transmission.
+          loRaTransmitDelay = millis();  // Immediate transmission for originated messages
         }
-        Serial.printf("[LoRa Schedule] Scheduled original message after %lu ms: %s\n",
-                      loRaTransmitDelay - millis(), message.c_str());
+        Serial.printf("[LoRa Schedule] Scheduled original message immediately: %s\n",
+                      message.c_str());
     }
 }
 
@@ -618,14 +623,15 @@ void transmitWithDutyCycle(const String& message) {
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
     status.transmittedViaLoRa = true;
-    // --- NEW: Mark the message as relayed via LoRa (separate from any WiFi relay) ---
-    messageTransmissions[messageID].relayedViaLoRa = true;
+    status.relayedViaLoRa = true;
+    // Clear the queued flag now that it has been transmitted.
+    status.queuedForLoRa = false;
     calculateDutyCyclePause(tx_time);
     last_tx = millis();
     drawMainScreen(tx_time);
     radio.startReceive();
 
-    // Forward the message via WiFi if it's not a heartbeat.
+    // After successful transmission, forward the message via WiFi if it's not a heartbeat.
     if (!message.startsWith("HEARTBEAT|")) {
       transmitViaWiFi(message);
     }
@@ -860,8 +866,9 @@ void loop() {
                 } else {
                   Serial.println("[LoRa Rx] Private message not for me, ignoring display.");
                 }
-                // --- Use the new "relayedViaLoRa" flag to decide whether to schedule a relay ---
-                if (!messageTransmissions[messageID].relayedViaLoRa) {
+                // --- Use the new "queuedForLoRa" flag to decide whether to schedule a relay ---
+                auto& status = messageTransmissions[messageID];
+                if (!status.queuedForLoRa && !status.relayedViaLoRa) {
                   scheduleLoRaTransmission(message);
                 }
                 uint64_t currentTime = millis();
@@ -1044,12 +1051,11 @@ void receivedCallback(uint32_t from, String& message) {
     Serial.println("[WiFi Rx] Private message not for me, ignoring display.");
   }
 
-  // --- Use the new "relayedViaLoRa" flag to schedule a relay if not already done ---
-  String myIdForRelay = getCustomNodeId(getNodeId());
+  // --- Use the new "queuedForLoRa" flag to schedule a relay if not already done ---
   auto& status = messageTransmissions[messageID];
-if (!status.relayedViaLoRa) {
+  if (!status.queuedForLoRa && !status.relayedViaLoRa) {
     scheduleLoRaTransmission(message);
-}
+  }
 }
 
 const char mainPageHtml[] PROGMEM = R"rawliteral(
@@ -1853,6 +1859,7 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
   uint64_t ageSec = ageMs / 1000;
@@ -1958,8 +1965,8 @@ void setupServerRoutes() {
       const auto &node = kv.second;
       if (currentTime - node.lastSeen <= FIFTEEN_MINUTES) {
         if (!firstIndirect) json += ",";
-        json += "{\"originatorId\":\"" + node.originatorId + "\",\"relayId\":\"" + node.relayId + "\",";
-        json += "\"rssi\":" + String(node.rssi) + ",\"snr\":" + String(node.snr, 2) + ",\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\","; 
+        json += "{\"originatorId\":\"" + node.originatorId + "\",\"relayId\":\"" + node.relayId + "\","; 
+        json += "\"rssi\":" + String(node.rssi) + ",\"snr\":" + String(node.snr, 2) + ",\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\",";
         json += "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
         firstIndirect = false;
       }
@@ -2000,6 +2007,9 @@ void setupServerRoutes() {
     addMessage(getCustomNodeId(getNodeId()), messageID, senderName, target, newMessage, "[LoRa]", relayID);
     Serial.printf("[LoRa Tx] Adding message: %s\n", constructedMessage.c_str());
 
+    // --- NEW: Immediately transmit the originated message on WiFi ---
+    transmitViaWiFi(constructedMessage);
+    // --- Schedule LoRa transmission immediately (for originated messages, our schedule uses no delay) ---
     scheduleLoRaTransmission(constructedMessage);
     request->redirect("/");
   });
