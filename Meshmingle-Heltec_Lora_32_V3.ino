@@ -1,4 +1,4 @@
-//Test v1.00.013
+//Test v1.00.014
 //10-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
@@ -9,6 +9,7 @@
 //Wifi was relaying agg heartbeats now its fixed.
 //indirect node timer was off it should have been ovee 30 mins since last seen so we dont see our own nodes as indirect.
 //agg was sending all nodes not just lora. causing problems.
+//nodelist removes indirect nodes after 31 mins.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -1120,61 +1121,52 @@ void loop() {
                   Serial.println("[LoRa Nodes] RelayID is own node, not updating.");
                 }
 
-                // Update indirect nodes if applicable (allow separate entries per relay)
-                if (originatorID != myId && relayID != myId && relayID != originatorID) {
-                  // First, check if the originator is in the WiFi mesh network.
-                  auto wifiNodes = mesh.getNodeList();  // Use auto here as well
-                  bool isWiFiNode = false;
-                  for (uint32_t node : wifiNodes) {
-                    if (getCustomNodeId(node) == originatorID) {
-                      isWiFiNode = true;
-                      break;
-                    }
-                  }
-                  if (isWiFiNode) {
-                    Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it's a WiFi node (treated as direct).\n", originatorID.c_str());
-                  } else {
-                    // Then check if it was recently seen directly via LoRa.
-                    bool seenDirectly = false;
-                    if (loraNodes.find(originatorID) != loraNodes.end()) {
-                      const uint64_t DIRECT_WINDOW = 1080000;  // 18 minutes in milliseconds
-                      uint64_t lastSeenDirect = loraNodes[originatorID].lastSeen;
-                      if (millis() - lastSeenDirect <= DIRECT_WINDOW) {
-                        seenDirectly = true;
-                      }
-                    }
-                    if (!seenDirectly) {
-                      NodeMetricsSample sample = { currentTime, rssi, snr };
-                      String key = originatorID + "-" + relayID; // Composite key for separate relay entries
-                      auto it = indirectNodes.find(key);
-                      if (it != indirectNodes.end()) {
-                        // Update existing indirect node entry for this relay
-                        it->second.lastSeen = currentTime;
-                        it->second.rssi = rssi;
-                        it->second.snr = snr;
-                        it->second.history.push_back(sample);
-                        if (it->second.history.size() > 60) {
-                          it->second.history.erase(it->second.history.begin());
-                        }
-                      } else {
-                        // Create a new indirect node entry for this relay
-                        IndirectNode indNode;
-                        indNode.originatorId = originatorID;
-                        indNode.relayId = relayID;
-                        indNode.rssi = rssi;
-                        indNode.snr = snr;
-                        indNode.lastSeen = currentTime;
-                        indNode.statusEmoji = "🛰️";
-                        indNode.history.push_back(sample);
-                        indirectNodes[key] = indNode;
-                      }
-                      Serial.printf("[Indirect Nodes] Updated indirect node: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
-                                    originatorID.c_str(), relayID.c_str(), rssi, snr);
-                    } else {
-                      Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it is seen directly.\n", originatorID.c_str());
-                    }
-                  }
-                }
+// Only update indirect nodes if the originator hasn't been seen directly within the last 15 minutes.
+if (originatorID != myId && relayID != myId && relayID != originatorID) {
+  const uint64_t ACTIVE_THRESHOLD = 900000; // 15 minutes in milliseconds
+
+  bool seenDirectly = false;
+  auto directIt = loraNodes.find(originatorID);
+  if (directIt != loraNodes.end()) {
+      // The node is in the direct list; check if it was seen recently.
+      if (millis() - directIt->second.lastSeen <= ACTIVE_THRESHOLD) {
+          seenDirectly = true;
+      }
+  }
+
+  if (seenDirectly) {
+      Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it was seen directly within the last 15 minutes.\n", originatorID.c_str());
+  } else {
+      // Proceed with adding/updating the indirect node record
+      uint64_t currentTime = millis();
+      NodeMetricsSample sample = { currentTime, rssi, snr };
+      String key = originatorID + "-" + relayID; // Composite key for separate relay entries
+      auto it = indirectNodes.find(key);
+      if (it != indirectNodes.end()) {
+          // Update existing indirect node entry
+          it->second.lastSeen = currentTime;
+          it->second.rssi = rssi;
+          it->second.snr = snr;
+          it->second.history.push_back(sample);
+          if (it->second.history.size() > 60) {
+              it->second.history.erase(it->second.history.begin());
+          }
+      } else {
+          // Create a new indirect node entry
+          IndirectNode indNode;
+          indNode.originatorId = originatorID;
+          indNode.relayId = relayID;
+          indNode.rssi = rssi;
+          indNode.snr = snr;
+          indNode.lastSeen = currentTime;
+          indNode.statusEmoji = "🛰️";
+          indNode.history.push_back(sample);
+          indirectNodes[key] = indNode;
+      }
+      Serial.printf("[Indirect Nodes] Updated indirect node: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
+                    originatorID.c_str(), relayID.c_str(), rssi, snr);
+  }
+}
               }
             }
           }
@@ -1827,7 +1819,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="nav-links">
-    <a href="/">Back</a> | <a href="/metrics">History</a>
+    <a href="/">Chat</a> | <a href="/metrics">History</a>
   </div>
   <h2>Meshmingle Nodes</h2>
   
@@ -2231,47 +2223,59 @@ void setupServerRoutes() {
     request->send(200, "application/json", "{\"totalCount\":" + String(getNodeCount()) + ", \"nodeId\":\"" + getCustomNodeId(getNodeId()) + "\"}");
   });
 
-  // --- Updated /nodesData route for indirect nodes ---
-  server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
-    updateMeshData();
-    String json = "{\"wifiNodes\":[";
-    auto wifiNodeList = mesh.getNodeList();
-    bool firstWifi = true;
-    for (auto node : wifiNodeList) {
-      if (!firstWifi) json += ",";
-      json += "\"" + getCustomNodeId(node) + "\"";
-      firstWifi = false;
+// Updated /nodesData route – displays WiFi nodes, direct LoRa nodes (active within 15 mins),
+// and indirect nodes (active within 31 mins).
+server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
+  updateMeshData();
+  String json = "{\"wifiNodes\":[";
+  
+  // Get WiFi nodes from the mesh network
+  auto wifiNodeList = mesh.getNodeList();
+  bool firstWifi = true;
+  for (auto node : wifiNodeList) {
+    if (!firstWifi) json += ",";
+    json += "\"" + getCustomNodeId(node) + "\"";
+    firstWifi = false;
+  }
+  json += "], \"loraNodes\":[";
+  
+  // Use a 16-minute threshold (960,000 ms) for direct LoRa nodes.
+  bool firstLora = true;
+  uint64_t currentTime = millis();
+  const uint64_t FIFTEEN_MINUTES = 960000; // 16 minutes in milliseconds
+  for (auto const& [nodeId, loraNode] : loraNodes) {
+    uint64_t lastSeenTime = loraNode.lastSeen;
+    if (currentTime - lastSeenTime <= FIFTEEN_MINUTES) {
+      if (!firstLora) json += ",";
+      json += "{\"nodeId\":\"" + nodeId + "\","
+            + "\"lastRSSI\":" + String(loraNode.lastRSSI) + ","
+            + "\"lastSNR\":" + String(loraNode.lastSNR, 2) + ","
+            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - lastSeenTime) + "\","
+            + "\"statusEmoji\":\"" + loraNode.statusEmoji + "\"}";
+      firstLora = false;
     }
-    json += "], \"loraNodes\":[";
-    bool firstLora = true;
-    uint64_t currentTime = millis();
-    const uint64_t FIFTEEN_MINUTES = 900000;
-    for (auto const& [nodeId, loraNode] : loraNodes) {
-      uint64_t lastSeenTime = loraNode.lastSeen;
-      if (currentTime - lastSeenTime <= FIFTEEN_MINUTES) {
-        if (!firstLora) json += ",";
-        json += "{\"nodeId\":\"" + nodeId + "\",\"lastRSSI\":" + String(loraNode.lastRSSI)
-             + ",\"lastSNR\":" + String(loraNode.lastSNR, 2)
-             + ",\"lastSeen\":\"" + formatRelativeTime(currentTime - lastSeenTime) + "\""
-             + ",\"statusEmoji\":\"" + loraNode.statusEmoji + "\"}";
-        firstLora = false;
-      }
+  }
+  json += "], \"indirectNodes\":[";
+  
+  // Use a 31-minute threshold (1,860,000 ms) for indirect nodes.
+  bool firstIndirect = true;
+  const uint64_t THIRTY_ONE_MINUTES = 1860000; // 31 minutes in milliseconds
+  for (auto const& kv : indirectNodes) {
+    const auto &node = kv.second;
+    if (currentTime - node.lastSeen <= THIRTY_ONE_MINUTES) {
+      if (!firstIndirect) json += ",";
+      json += "{\"originatorId\":\"" + node.originatorId + "\","
+            + "\"relayId\":\"" + node.relayId + "\","
+            + "\"rssi\":" + String(node.rssi) + ","
+            + "\"snr\":" + String(node.snr, 2) + ","
+            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\","
+            + "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
+      firstIndirect = false;
     }
-    json += "], \"indirectNodes\":[";
-    bool firstIndirect = true;
-    for (auto const& kv : indirectNodes) {
-      const auto &node = kv.second;
-      if (currentTime - node.lastSeen <= FIFTEEN_MINUTES) {
-        if (!firstIndirect) json += ",";
-        json += "{\"originatorId\":\"" + node.originatorId + "\",\"relayId\":\"" + node.relayId + "\","; 
-        json += "\"rssi\":" + String(node.rssi) + ",\"snr\":" + String(node.snr, 2) + ",\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\",";
-        json += "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
-        firstIndirect = false;
-      }
-    }
-    json += "]}";
-    request->send(200, "application/json", json);
-  });
+  }
+  json += "]}";
+  request->send(200, "application/json", json);
+});
 
   // --- Updated /update route to accept an optional "target" parameter ---
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest* request) {
