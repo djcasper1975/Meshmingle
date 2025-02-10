@@ -1,13 +1,11 @@
-//Test v1.00.010
-//09-02-2025
+//Test v1.00.011
+//10-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//more relay fixes wifi was marking relayed as true in some cases causing lora to not relay.
-//duty cycle checks working again. i broke it on last update.
-//green box that shoewed messages was updated to show rssi and snr of one of the relays. i missed parts out. i will rework on this another time.
+//Hopefully every 31 mins you will see indirect 1 hop nodes from heartbeat aswell as if a message passes through our system with ANY hop. (if the network gets busy this update time will be longer.)
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -72,6 +70,10 @@ const unsigned long transmissionHistoryRetention = 86400000; // 86,400,000 ms = 
 
 // Instead of a single message buffer, we now use a queue for outgoing LoRa messages.
 std::vector<String> loraTransmissionQueue;
+
+// Aggregated Heartbeat Interval: 31 minutes (31 * 60 * 1000 = 1,860,000 ms)
+const unsigned long aggregatedHeartbeatInterval = 1860000;
+unsigned long lastAggregatedHeartbeatTime = 0;
 
 // Duty Cycle Definitions and Variables
 #define DUTY_CYCLE_LIMIT_MS 360000   // 6 minutes in a 60-minute window
@@ -298,30 +300,30 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
 
   auto& status = messageTransmissions[messageID];
 
-// If the message has already been added...
-if (status.addedToMessages) {
-  // Look for the existing message in the messages vector.
-  for (auto &msg : messages) {
-    if (msg.messageID == messageID) {
-      // Check if this message originates from our node.
-      String myId = getCustomNodeId(getNodeId());
-      if (msg.nodeId == myId) {
-        // Do not update the UI sent message with relay info.
+  // If the message has already been added...
+  if (status.addedToMessages) {
+    // Look for the existing message in the messages vector.
+    for (auto &msg : messages) {
+      if (msg.messageID == messageID) {
+        // Check if this message originates from our node.
+        String myId = getCustomNodeId(getNodeId());
+        if (msg.nodeId == myId) {
+          // Do not update the UI sent message with relay info.
+          break;
+        }
+        // Otherwise, if the new message is from LoRa but the stored one is not, update it.
+        if (source == "[LoRa]" && msg.source != "[LoRa]") {
+          Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
+          msg.source = "[LoRa]";
+          msg.rssi   = rssi;   // update RSSI
+          msg.snr    = snr;    // update SNR
+          msg.relayID = relayID; // optionally update relayID if needed
+        }
         break;
       }
-      // Otherwise, if the new message is from LoRa but the stored one is not, update it.
-      if (source == "[LoRa]" && msg.source != "[LoRa]") {
-        Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
-        msg.source = "[LoRa]";
-        msg.rssi   = rssi;   // update RSSI
-        msg.snr    = snr;    // update SNR
-        msg.relayID = relayID; // optionally update relayID if needed
-      }
-      break;
     }
+    return;
   }
-  return;
-}
 
   // For private messages (recipient != "ALL") only add if this node is either the originator or the designated recipient.
   String myId = getCustomNodeId(getNodeId());
@@ -731,7 +733,6 @@ void transmitWithDutyCycle(const String& message) {
   }
 }
 
-
 unsigned long lastHeartbeatTime = 0;
 const unsigned long firstHeartbeatDelay = 20000; // 20 seconds for first heartbeat
 const unsigned long heartbeatInterval = 900000; // 15 minutes for subsequent heartbeats
@@ -770,6 +771,57 @@ void sendHeartbeat() {
     radio.startReceive();
   } else {
     Serial.printf("[Heartbeat Tx] Failed with error code: %i\n", transmitStatus);
+  }
+}
+
+void sendAggregatedHeartbeat() {
+  // Start building the message with the header and our node ID
+  String aggMsgWithoutCRC = "AGG_HEARTBEAT|" + getCustomNodeId(getNodeId());
+  
+  // Append each indirect node’s originator ID that is NOT directly seen
+  // (This assumes that nodes in loraNodes have been heard directly recently.)
+  for (auto const &pair : indirectNodes) {
+    const IndirectNode &indNode = pair.second;
+    // If the originator is not in the direct LoRa node list, include it.
+    if (loraNodes.find(indNode.originatorId) == loraNodes.end()) {
+      aggMsgWithoutCRC += "|" + indNode.originatorId;
+    }
+  }
+  
+  // Calculate the CRC for the aggregated message (as you do for other messages)
+  uint16_t crc = crc16_ccitt((const uint8_t *)aggMsgWithoutCRC.c_str(), aggMsgWithoutCRC.length());
+  char crcStr[5];
+  sprintf(crcStr, "%04X", crc);
+  String aggMessage = aggMsgWithoutCRC + "|" + String(crcStr);
+  
+  // Before sending, check duty cycle and if the radio is available (similar to sendHeartbeat())
+  if (!isDutyCycleAllowed()) {
+    Serial.println("[Aggregated Heartbeat Tx] Duty cycle limit reached, skipping.");
+    return;
+  }
+  
+  if (radio.available()) {
+    Serial.println("[Aggregated Heartbeat Tx] Radio busy, delaying aggregated heartbeat.");
+    return;
+  }
+  
+  // Transmit the aggregated heartbeat message
+  uint64_t txStart = millis();
+  Serial.printf("[Aggregated Heartbeat Tx] Sending: %s\n", aggMessage.c_str());
+  heltec_led(50);
+  int transmitStatus = radio.transmit(aggMessage.c_str());
+  uint64_t txTime = millis() - txStart;
+  heltec_led(0);
+  
+  if (transmitStatus == RADIOLIB_ERR_NONE) {
+    Serial.printf("[Aggregated Heartbeat Tx] Sent successfully (%llu ms)\n", txTime);
+    calculateDutyCyclePause(txTime);
+    last_tx = millis();
+    // Optionally update the display:
+    drawMainScreen(txTime);
+    radio.startReceive();
+  } else {
+    Serial.printf("[Aggregated Heartbeat Tx] Failed with error code: %i\n", transmitStatus);
   }
 }
 
@@ -850,6 +902,18 @@ void loop() {
     lastHeartbeatTime = millis();
   }
 
+  // Normal heartbeat (existing logic)
+  if (millis() - lastHeartbeatTime >= heartbeatInterval) {
+    sendHeartbeat();
+    lastHeartbeatTime = millis();
+  }
+
+  // --- New Aggregated Heartbeat Check ---
+  if (millis() - lastAggregatedHeartbeatTime >= aggregatedHeartbeatInterval) {
+    sendAggregatedHeartbeat();
+    lastAggregatedHeartbeatTime = millis();
+  }
+
   if (rxFlag) {
     rxFlag = false;
     String message;
@@ -872,9 +936,8 @@ void loop() {
         } else {
           Serial.println("[LoRa Rx] CRC valid.");
 
-          // --- Only process messages from our system ---
-          // For non-heartbeat messages, check that the first token (messageID) starts with our expected prefix.
-          if (!messageWithoutCRC.startsWith("HEARTBEAT|")) {
+          // --- For messages other than heartbeat types, verify the prefix ---
+          if (!messageWithoutCRC.startsWith("HEARTBEAT|") && !messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
             int firstSeparator = messageWithoutCRC.indexOf('|');
             if (firstSeparator == -1) {
               Serial.println("[LoRa Rx] Invalid message format.");
@@ -889,7 +952,7 @@ void loop() {
             }
           }
 
-          // --- Heartbeat Handling (Unchanged) ---
+          // --- Heartbeat Handling ---
           if (messageWithoutCRC.startsWith("HEARTBEAT|")) {
             String senderNodeId = messageWithoutCRC.substring(strlen("HEARTBEAT|"));
             Serial.printf("[LoRa Rx] Heartbeat from %s\n", senderNodeId.c_str());
@@ -913,6 +976,70 @@ void loop() {
               Serial.printf("[LoRa Nodes] Updated/Added node: %s (Heartbeat)\n", senderNodeId.c_str());
             } else {
               Serial.println("[LoRa Rx] Own heartbeat, ignore.");
+            }
+          }
+          // --- Aggregated Heartbeat Handling ---
+          else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+            Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
+            // Expected format: AGG_HEARTBEAT|<relayID>|<originatorID1>|<originatorID2>|...
+            int firstSep = messageWithoutCRC.indexOf('|');
+            if (firstSep == -1) {
+              Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
+            } else {
+              int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);
+              String senderRelayId;
+              if (secondSep == -1) {
+                senderRelayId = messageWithoutCRC.substring(firstSep + 1);
+              } else {
+                senderRelayId = messageWithoutCRC.substring(firstSep + 1, secondSep);
+              }
+              // Process each originator ID listed (if any)
+              int startPos = secondSep + 1;
+              while (true) {
+                int nextSep = messageWithoutCRC.indexOf('|', startPos);
+                String originatorId;
+                if (nextSep == -1) {
+                  originatorId = messageWithoutCRC.substring(startPos);
+                } else {
+                  originatorId = messageWithoutCRC.substring(startPos, nextSep);
+                }
+                if (originatorId.length() > 0) {
+                  // Only update if the originator is not in direct LoRa nodes
+                  if (loraNodes.find(originatorId) == loraNodes.end()) {
+                    uint64_t currentTime = millis();
+                    int rssi = radio.getRSSI();
+                    float snr = radio.getSNR();
+                    NodeMetricsSample sample = { currentTime, rssi, snr };
+                    String key = originatorId + "-" + senderRelayId; // Composite key
+                    auto it = indirectNodes.find(key);
+                    if (it != indirectNodes.end()) {
+                      // Update existing entry
+                      it->second.lastSeen = currentTime;
+                      it->second.rssi = rssi;
+                      it->second.snr = snr;
+                      it->second.history.push_back(sample);
+                      if (it->second.history.size() > 60) {
+                        it->second.history.erase(it->second.history.begin());
+                      }
+                    } else {
+                      // Create new indirect node entry
+                      IndirectNode indNode;
+                      indNode.originatorId = originatorId;
+                      indNode.relayId = senderRelayId;
+                      indNode.rssi = rssi;
+                      indNode.snr = snr;
+                      indNode.lastSeen = currentTime;
+                      indNode.statusEmoji = "🛰️";
+                      indNode.history.push_back(sample);
+                      indirectNodes[key] = indNode;
+                    }
+                    Serial.printf("[Indirect Nodes] Updated via Aggregated Heartbeat: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
+                                  originatorId.c_str(), senderRelayId.c_str(), rssi, snr);
+                  }
+                }
+                if (nextSep == -1) break;
+                startPos = nextSep + 1;
+              }
             }
           }
           // --- Non-Heartbeat (Message) Handling ---
@@ -1042,13 +1169,13 @@ void loop() {
   dnsServer.processNextRequest();
 
   // --- Cleanup: Remove old LoRa nodes, indirect nodes, and transmission statuses ---
-if (millis() - lastCleanupTime >= cleanupInterval) {
-  cleanupLoRaNodes();          
-  cleanupIndirectNodes();  
-  cleanupPendingTxQueue();      // <-- New: Clean up pending TX messages
-  cleanupTransmissionHistory(); // <-- New: Clean up transmission history older than 24 hours
-  lastCleanupTime = millis();
-}
+  if (millis() - lastCleanupTime >= cleanupInterval) {
+    cleanupLoRaNodes();          
+    cleanupIndirectNodes();  
+    cleanupPendingTxQueue();      // <-- New: Clean up pending TX messages
+    cleanupTransmissionHistory(); // <-- New: Clean up transmission history older than 24 hours
+    lastCleanupTime = millis();
+  }
 
   if (millis() - lastHeartbeatTime >= heartbeatInterval) {
     sendHeartbeat();
@@ -1943,7 +2070,6 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
   uint64_t ageSec = ageMs / 1000;
@@ -2326,4 +2452,3 @@ uint32_t getNodeId() {
 void initServer() {
   setupServerRoutes();
 }
-
