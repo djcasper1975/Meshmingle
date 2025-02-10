@@ -1,3 +1,25 @@
+//Test v1.00.012
+//10-02-2025
+//MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
+//EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
+//After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
+//Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
+//Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
+//Hopefully every 31 mins you will see indirect 1 hop nodes from heartbeat aswell as if a message passes through our system with ANY hop. (if the network gets busy this update time will be longer.)
+//Wifi was relaying agg heartbeats now its fixed.
+//indirect node timer was off it should have been ovee 30 mins since last seen so we dont see our own nodes as indirect.
+////////////////////////////////////////////////////////////////////////
+// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
+// MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
+// M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
+// M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
+// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
+////////////////////////////////////////////////////////////////////////
+
+#define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
+#include <heltec_unofficial.h> // Heltec library for OLED and LoRa
+#include <painlessMesh.h>
+#include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 #include <Wire.h>
@@ -984,37 +1006,50 @@ void loop() {
                   originatorId = messageWithoutCRC.substring(startPos, nextSep);
                 }
                 if (originatorId.length() > 0) {
-                  // Only update if the originator is not in direct LoRa nodes
-                  if (loraNodes.find(originatorId) == loraNodes.end()) {
-                    uint64_t currentTime = millis();
-                    int rssi = radio.getRSSI();
-                    float snr = radio.getSNR();
-                    NodeMetricsSample sample = { currentTime, rssi, snr };
-                    String key = originatorId + "-" + senderRelayId; // Composite key
-                    auto it = indirectNodes.find(key);
-                    if (it != indirectNodes.end()) {
-                      // Update existing entry
-                      it->second.lastSeen = currentTime;
-                      it->second.rssi = rssi;
-                      it->second.snr = snr;
-                      it->second.history.push_back(sample);
-                      if (it->second.history.size() > 60) {
-                        it->second.history.erase(it->second.history.begin());
-                      }
-                    } else {
-                      // Create new indirect node entry
-                      IndirectNode indNode;
-                      indNode.originatorId = originatorId;
-                      indNode.relayId = senderRelayId;
-                      indNode.rssi = rssi;
-                      indNode.snr = snr;
-                      indNode.lastSeen = currentTime;
-                      indNode.statusEmoji = "🛰️";
-                      indNode.history.push_back(sample);
-                      indirectNodes[key] = indNode;
+                  // Check if the originator is already in the WiFi mesh network
+                  auto wifiNodes = mesh.getNodeList();  // Use auto instead of std::vector
+                  bool isWiFiNode = false;
+                  for (uint32_t node : wifiNodes) {
+                    if (getCustomNodeId(node) == originatorId) {
+                      isWiFiNode = true;
+                      break;
                     }
-                    Serial.printf("[Indirect Nodes] Updated via Aggregated Heartbeat: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
-                                  originatorId.c_str(), senderRelayId.c_str(), rssi, snr);
+                  }
+                  if (isWiFiNode) {
+                    Serial.printf("[Indirect Nodes] Skipped aggregated indirect update for %s because it's a WiFi node (treated as direct).\n", originatorId.c_str());
+                  } else {
+                    // Only update if the originator is not in direct LoRa nodes
+                    if (loraNodes.find(originatorId) == loraNodes.end()) {
+                      uint64_t currentTime = millis();
+                      int rssi = radio.getRSSI();
+                      float snr = radio.getSNR();
+                      NodeMetricsSample sample = { currentTime, rssi, snr };
+                      String key = originatorId + "-" + senderRelayId; // Composite key
+                      auto it = indirectNodes.find(key);
+                      if (it != indirectNodes.end()) {
+                        // Update existing entry
+                        it->second.lastSeen = currentTime;
+                        it->second.rssi = rssi;
+                        it->second.snr = snr;
+                        it->second.history.push_back(sample);
+                        if (it->second.history.size() > 60) {
+                          it->second.history.erase(it->second.history.begin());
+                        }
+                      } else {
+                        // Create new indirect node entry
+                        IndirectNode indNode;
+                        indNode.originatorId = originatorId;
+                        indNode.relayId = senderRelayId;
+                        indNode.rssi = rssi;
+                        indNode.snr = snr;
+                        indNode.lastSeen = currentTime;
+                        indNode.statusEmoji = "🛰️";
+                        indNode.history.push_back(sample);
+                        indirectNodes[key] = indNode;
+                      }
+                      Serial.printf("[Indirect Nodes] Updated via Aggregated Heartbeat: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
+                                    originatorId.c_str(), senderRelayId.c_str(), rssi, snr);
+                    }
                   }
                 }
                 if (nextSep == -1) break;
@@ -1088,43 +1123,57 @@ void loop() {
 
                 // Update indirect nodes if applicable (allow separate entries per relay)
                 if (originatorID != myId && relayID != myId && relayID != originatorID) {
-                  bool seenDirectly = false;
-                  if (loraNodes.find(originatorID) != loraNodes.end()) {
-                    const uint64_t THIRTY_SECONDS = 30000;
-                    uint64_t lastSeenDirect = loraNodes[originatorID].lastSeen;
-                    if (millis() - lastSeenDirect <= THIRTY_SECONDS) {
-                      seenDirectly = true;
+                  // First, check if the originator is in the WiFi mesh network.
+                  auto wifiNodes = mesh.getNodeList();  // Use auto here as well
+                  bool isWiFiNode = false;
+                  for (uint32_t node : wifiNodes) {
+                    if (getCustomNodeId(node) == originatorID) {
+                      isWiFiNode = true;
+                      break;
                     }
                   }
-                  if (!seenDirectly) {
-                    NodeMetricsSample sample = { currentTime, rssi, snr };
-                    String key = originatorID + "-" + relayID; // Composite key for separate relay entries
-                    auto it = indirectNodes.find(key);
-                    if (it != indirectNodes.end()) {
-                      // Update existing indirect node entry for this relay
-                      it->second.lastSeen = currentTime;
-                      it->second.rssi = rssi;
-                      it->second.snr = snr;
-                      it->second.history.push_back(sample);
-                      if (it->second.history.size() > 60) {
-                        it->second.history.erase(it->second.history.begin());
-                      }
-                    } else {
-                      // Create a new indirect node entry for this relay
-                      IndirectNode indNode;
-                      indNode.originatorId = originatorID;
-                      indNode.relayId = relayID;
-                      indNode.rssi = rssi;
-                      indNode.snr = snr;
-                      indNode.lastSeen = currentTime;
-                      indNode.statusEmoji = "🛰️";
-                      indNode.history.push_back(sample);
-                      indirectNodes[key] = indNode;
-                    }
-                    Serial.printf("[Indirect Nodes] Updated indirect node: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
-                                  originatorID.c_str(), relayID.c_str(), rssi, snr);
+                  if (isWiFiNode) {
+                    Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it's a WiFi node (treated as direct).\n", originatorID.c_str());
                   } else {
-                    Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it is seen directly.\n", originatorID.c_str());
+                    // Then check if it was recently seen directly via LoRa.
+                    bool seenDirectly = false;
+                    if (loraNodes.find(originatorID) != loraNodes.end()) {
+                      const uint64_t DIRECT_WINDOW = 1080000;  // 18 minutes in milliseconds
+                      uint64_t lastSeenDirect = loraNodes[originatorID].lastSeen;
+                      if (millis() - lastSeenDirect <= DIRECT_WINDOW) {
+                        seenDirectly = true;
+                      }
+                    }
+                    if (!seenDirectly) {
+                      NodeMetricsSample sample = { currentTime, rssi, snr };
+                      String key = originatorID + "-" + relayID; // Composite key for separate relay entries
+                      auto it = indirectNodes.find(key);
+                      if (it != indirectNodes.end()) {
+                        // Update existing indirect node entry for this relay
+                        it->second.lastSeen = currentTime;
+                        it->second.rssi = rssi;
+                        it->second.snr = snr;
+                        it->second.history.push_back(sample);
+                        if (it->second.history.size() > 60) {
+                          it->second.history.erase(it->second.history.begin());
+                        }
+                      } else {
+                        // Create a new indirect node entry for this relay
+                        IndirectNode indNode;
+                        indNode.originatorId = originatorID;
+                        indNode.relayId = relayID;
+                        indNode.rssi = rssi;
+                        indNode.snr = snr;
+                        indNode.lastSeen = currentTime;
+                        indNode.statusEmoji = "🛰️";
+                        indNode.history.push_back(sample);
+                        indirectNodes[key] = indNode;
+                      }
+                      Serial.printf("[Indirect Nodes] Updated indirect node: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
+                                    originatorID.c_str(), relayID.c_str(), rssi, snr);
+                    } else {
+                      Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it is seen directly.\n", originatorID.c_str());
+                    }
                   }
                 }
               }
@@ -1150,8 +1199,8 @@ void loop() {
 
   // --- Cleanup: Remove old LoRa nodes, indirect nodes, and transmission statuses ---
   if (millis() - lastCleanupTime >= cleanupInterval) {
-    cleanupLoRaNodes();          
-    cleanupIndirectNodes();  
+    cleanupLoRaNodes();
+    cleanupIndirectNodes();
     cleanupPendingTxQueue();      // <-- New: Clean up pending TX messages
     cleanupTransmissionHistory(); // <-- New: Clean up transmission history older than 24 hours
     lastCleanupTime = millis();
@@ -1801,7 +1850,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// --- METRICS HISTORY PAGE (unchanged) ---
+// --- METRICS HISTORY PAGE (unchanged except for centering the toggle button) ---
 const char metricsPageHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -1877,6 +1926,24 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
     .nav-links a:hover {
       text-decoration: underline;
     }
+    /* New styles for collapsible history details */
+    .history-container {
+      display: none;
+      margin-top: 10px;
+    }
+    .toggle-btn {
+      background-color: #007bff;
+      color: #fff;
+      border: none;
+      padding: 5px 10px;
+      cursor: pointer;
+      border-radius: 4px;
+      margin: 10px auto;  /* Center horizontally */
+      display: block;     /* Ensure block-level for auto margins */
+    }
+    .toggle-btn:hover {
+      background-color: #0056b3;
+    }
   </style>
   <script>
     // On page load, fetch the device count and metrics history data.
@@ -1894,6 +1961,11 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
     };
 
     function fetchHistory() {
+      // Check if any details containers are open.
+      // If so, skip the refresh.
+      if (document.querySelector('.history-container[style*="display: block"]')) {
+        return;
+      }
       fetch("/metricsHistoryData")
         .then(response => response.json())
         .then(data => {
@@ -1916,7 +1988,7 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
               nodeTitle.textContent = `Node ID: ${node.nodeId}`;
               nodeBlock.appendChild(nodeTitle);
 
-              // Summary table (best signal)
+              // Summary table (always visible)
               const summaryTable = document.createElement("table");
               const summaryHeader = document.createElement("thead");
               summaryHeader.innerHTML = `
@@ -1932,7 +2004,18 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
               summaryTable.appendChild(summaryBody);
               nodeBlock.appendChild(summaryTable);
 
-              // History table for node
+              // Toggle button for detailed history
+              const toggleBtn = document.createElement("button");
+              toggleBtn.textContent = "Show Details";
+              toggleBtn.classList.add("toggle-btn");
+              toggleBtn.onclick = function() {
+                toggleDetails(this);
+              };
+              nodeBlock.appendChild(toggleBtn);
+
+              // Collapsible container for node history table
+              const historyDiv = document.createElement("div");
+              historyDiv.classList.add("history-container");
               const historyTable = document.createElement("table");
               const historyHeader = document.createElement("thead");
               historyHeader.innerHTML = `
@@ -1949,7 +2032,8 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
                 historyBody.appendChild(row);
               });
               historyTable.appendChild(historyBody);
-              nodeBlock.appendChild(historyTable);
+              historyDiv.appendChild(historyTable);
+              nodeBlock.appendChild(historyDiv);
 
               container.appendChild(nodeBlock);
             });
@@ -1957,6 +2041,10 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 
           // --- Indirect Nodes History Section (Grouped by Originator) ---
           if (data.indirectNodes && data.indirectNodes.length > 0) {
+            const indirectHeader = document.createElement("h3");
+            indirectHeader.textContent = "Indirect Nodes History (Grouped by Originator)";
+            container.appendChild(indirectHeader);
+
             // Group indirect node records by originator (each record has a 'nodeId' representing the originator)
             const groupedIndirect = {};
             data.indirectNodes.forEach(indirect => {
@@ -1967,31 +2055,26 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
               groupedIndirect[originator].push(indirect);
             });
 
-            const indirectHeader = document.createElement("h3");
-            indirectHeader.textContent = "Indirect Nodes History (Grouped by Originator)";
-            container.appendChild(indirectHeader);
-
-            // For each originator, create a container with a relays table
             Object.keys(groupedIndirect).forEach(originator => {
               const group = groupedIndirect[originator];
               const originatorBlock = document.createElement("div");
               originatorBlock.classList.add("node-block");
 
-              // Originator header (like direct node header)
+              // Originator header
               const originatorTitle = document.createElement("div");
               originatorTitle.classList.add("node-title");
               originatorTitle.textContent = `Originator: ${originator}`;
               originatorBlock.appendChild(originatorTitle);
 
-              // For each relay associated with this originator, render its own summary and history tables
+              // For each relay associated with this originator, render a collapsible sub-node block
               group.forEach(relay => {
-                const relayBlock = document.createElement("div");
-                relayBlock.classList.add("sub-node-block");
+                const subNodeBlock = document.createElement("div");
+                subNodeBlock.classList.add("sub-node-block");
 
                 const relayTitle = document.createElement("div");
                 relayTitle.classList.add("node-title");
                 relayTitle.textContent = `Relay ID: ${relay.relayId}`;
-                relayBlock.appendChild(relayTitle);
+                subNodeBlock.appendChild(relayTitle);
 
                 // Relay summary table
                 const relaySummaryTable = document.createElement("table");
@@ -2007,9 +2090,20 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
                 relaySummaryRow.innerHTML = `<td>${relay.bestRssi}</td><td>${relay.bestSnr}</td>`;
                 relaySummaryBody.appendChild(relaySummaryRow);
                 relaySummaryTable.appendChild(relaySummaryBody);
-                relayBlock.appendChild(relaySummaryTable);
+                subNodeBlock.appendChild(relaySummaryTable);
 
-                // Relay history table
+                // Toggle button for relay details
+                const toggleBtnRelay = document.createElement("button");
+                toggleBtnRelay.textContent = "Show Details";
+                toggleBtnRelay.classList.add("toggle-btn");
+                toggleBtnRelay.onclick = function() {
+                  toggleDetails(this);
+                };
+                subNodeBlock.appendChild(toggleBtnRelay);
+
+                // Collapsible container for relay history table
+                const relayHistoryDiv = document.createElement("div");
+                relayHistoryDiv.classList.add("history-container");
                 const relayHistoryTable = document.createElement("table");
                 const relayHistoryHeader = document.createElement("thead");
                 relayHistoryHeader.innerHTML = `
@@ -2026,9 +2120,10 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
                   relayHistoryBody.appendChild(row);
                 });
                 relayHistoryTable.appendChild(relayHistoryBody);
-                relayBlock.appendChild(relayHistoryTable);
+                relayHistoryDiv.appendChild(relayHistoryTable);
+                subNodeBlock.appendChild(relayHistoryDiv);
 
-                originatorBlock.appendChild(relayBlock);
+                originatorBlock.appendChild(subNodeBlock);
               });
 
               container.appendChild(originatorBlock);
@@ -2038,6 +2133,17 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
         .catch(error => {
           console.error("Error fetching metrics history:", error);
         });
+    }
+
+    function toggleDetails(button) {
+      var container = button.nextElementSibling;
+      if (container.style.display === "none" || container.style.display === "") {
+        container.style.display = "block";
+        button.textContent = "Hide Details";
+      } else {
+        container.style.display = "none";
+        button.textContent = "Show Details";
+      }
     }
   </script>
 </head>
@@ -2051,6 +2157,7 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
+
 
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
