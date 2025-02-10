@@ -1,4 +1,4 @@
-//Test v1.00.012
+//Test v1.00.013
 //10-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
@@ -8,6 +8,7 @@
 //Hopefully every 31 mins you will see indirect 1 hop nodes from heartbeat aswell as if a message passes through our system with ANY hop. (if the network gets busy this update time will be longer.)
 //Wifi was relaying agg heartbeats now its fixed.
 //indirect node timer was off it should have been ovee 30 mins since last seen so we dont see our own nodes as indirect.
+//agg was sending all nodes not just lora. causing problems.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -777,26 +778,25 @@ void sendHeartbeat() {
 }
 
 void sendAggregatedHeartbeat() {
-  // Start building the message with the header and our node ID
+  // Start building the message with the header and our own node ID.
   String aggMsgWithoutCRC = "AGG_HEARTBEAT|" + getCustomNodeId(getNodeId());
   
-  // Append each indirect node’s originator ID that is NOT directly seen
-  // (This assumes that nodes in loraNodes have been heard directly recently.)
-  for (auto const &pair : indirectNodes) {
-    const IndirectNode &indNode = pair.second;
-    // If the originator is not in the direct LoRa node list, include it.
-    if (loraNodes.find(indNode.originatorId) == loraNodes.end()) {
-      aggMsgWithoutCRC += "|" + indNode.originatorId;
+  // Append each direct LoRa node's ID (except our own)
+  for (auto const &pair : loraNodes) {
+    const LoRaNode &loraNode = pair.second;
+    // Skip our own node ID so we don't include it in the list.
+    if (loraNode.nodeId != getCustomNodeId(getNodeId())) {
+      aggMsgWithoutCRC += "|" + loraNode.nodeId;
     }
   }
   
-  // Calculate the CRC for the aggregated message (as you do for other messages)
+  // Calculate the CRC for the aggregated message
   uint16_t crc = crc16_ccitt((const uint8_t *)aggMsgWithoutCRC.c_str(), aggMsgWithoutCRC.length());
   char crcStr[5];
   sprintf(crcStr, "%04X", crc);
   String aggMessage = aggMsgWithoutCRC + "|" + String(crcStr);
   
-  // Before sending, check duty cycle and if the radio is available (similar to sendHeartbeat())
+  // Check duty cycle and radio availability before sending.
   if (!isDutyCycleAllowed()) {
     Serial.println("[Aggregated Heartbeat Tx] Duty cycle limit reached, skipping.");
     return;
@@ -819,7 +819,6 @@ void sendAggregatedHeartbeat() {
     Serial.printf("[Aggregated Heartbeat Tx] Sent successfully (%llu ms)\n", txTime);
     calculateDutyCyclePause(txTime);
     last_tx = millis();
-    // Optionally update the display:
     drawMainScreen(txTime);
     radio.startReceive();
   } else {
