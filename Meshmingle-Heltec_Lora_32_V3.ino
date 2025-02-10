@@ -1,23 +1,3 @@
-//Test v1.00.011
-//10-02-2025
-//MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
-//EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
-//After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
-//Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
-//Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//Hopefully every 31 mins you will see indirect 1 hop nodes from heartbeat aswell as if a message passes through our system with ANY hop. (if the network gets busy this update time will be longer.)
-////////////////////////////////////////////////////////////////////////
-// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
-// MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
-// M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
-// M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
-// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
-////////////////////////////////////////////////////////////////////////
-
-#define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
-#include <heltec_unofficial.h> // Heltec library for OLED and LoRa
-#include <painlessMesh.h>
-#include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 #include <Wire.h>
@@ -1216,6 +1196,12 @@ void receivedCallback(uint32_t from, String& message) {
     Serial.println("[WiFi Rx] CRC valid.");
   }
 
+      // Skip both plain and aggregated heartbeat messages in WiFi.
+    if (messageWithoutCRC.startsWith("HEARTBEAT|") || messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+        Serial.println("[WiFi Rx] Skipping heartbeat relay over WiFi.");
+        return;
+    }
+
   // --- Only accept messages from our system ---
 // For non-heartbeat messages, verify that the first token (messageID) starts with "!M"
   int firstSeparator = messageWithoutCRC.indexOf('|');
@@ -1247,10 +1233,6 @@ void receivedCallback(uint32_t from, String& message) {
   String messageContent = messageWithoutCRC.substring(fourthSeparator + 1, fifthSeparator);
   String relayID = messageWithoutCRC.substring(fifthSeparator + 1);
 
-  if (messageWithoutCRC.startsWith("HEARTBEAT|")) {
-    Serial.println("[WiFi Rx] Skipping heartbeat relay over WiFi.");
-    return;
-  }
 
   String myId = getCustomNodeId(getNodeId());
   // Only add and display the message if it is public or intended for us.
