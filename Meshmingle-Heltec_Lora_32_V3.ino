@@ -1,4 +1,4 @@
-//Test v1.00.015
+//Test v1.00.016
 //11-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
@@ -8,6 +8,10 @@
 //nodes we could see direct was still showing as indirect when reciving agg heartbeat. seems ok now.
 //added relay id to recived messages from lora so you will see a relay id.
 //we could see relay id on sent messages !! thats  fixed.
+//added indirect nodes to nodecount if its not there in wifi or lora direct.
+//added count down to send button.
+//made delay changes on random delay max is now 15 seconds.
+//relay cue sets timer at front of cue instead of when its added to cue this is cleared aftere 35 seconds if not sent.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -27,6 +31,7 @@
 #include <vector>         // For handling list of messages and our queue
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>
+#include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
 
 // ===================
 // TRANSMISSION TRACKING
@@ -38,7 +43,7 @@ struct TransmissionStatus {
   bool relayedViaWiFi = false;     // NEW: whether the message has been relayed via WiFi
   bool relayedViaLoRa = false;     // NEW: whether the message has been relayed via LoRa
   bool queuedForLoRa = false;      // NEW: whether the message is already queued for LoRa transmission
-  uint64_t timestamp = millis();   // record when the entry was created/updated
+  uint64_t timestamp = millis();   // record when the message becomes active (modified when it reaches head)
 };
 
 // Map to track transmissions by message ID
@@ -53,7 +58,7 @@ std::map<String, TransmissionStatus> messageTransmissions;
 #define FREQUENCY 869.4000 
 #define BANDWIDTH 250.0 
 #define SPREADING_FACTOR 11 
-#define TRANSMIT_POWER 22 
+#define TRANSMIT_POWER 21 
 #define CODING_RATE 8  
 String rxdata;
 // Global RX flag
@@ -64,8 +69,8 @@ uint64_t last_tx = 0;
 uint64_t minimum_pause = 0;
 unsigned long lastTransmitTime = 0;  
 
-// Timeout for pending transmissions (e.g. 5 minutes)
-const unsigned long pendingTxTimeout = 150000; // 300,000 ms = 2.5 minutes
+// Timeout for pending transmissions (e.g. 35 seconds)
+const unsigned long pendingTxTimeout = 35000; // 35,000 ms = 35 seconds
 
 // Retain transmission history for 24 hours
 const unsigned long transmissionHistoryRetention = 86400000; // 86,400,000 ms = 24 hours
@@ -226,6 +231,10 @@ std::map<String, IndirectNode> indirectNodes;
 unsigned long lastCleanupTime = 0;
 const unsigned long cleanupInterval = 60000; // 1 minute
 
+uint32_t getNodeId() {
+  return currentNodeId;
+}
+
 void cleanupLoRaNodes() {
   uint64_t currentTime = millis();
   const uint64_t timeout = 86400000; // 24 hours
@@ -253,30 +262,33 @@ void cleanupIndirectNodes() {
   }
 }
 
+// --- MODIFIED: cleanupPendingTxQueue() now checks only the head of the queue and resets its timestamp when a new head appears.
 void cleanupPendingTxQueue() {
   unsigned long now = millis();
-  // Iterate over the queue in reverse order so we can remove items safely.
-  for (int i = loraTransmissionQueue.size() - 1; i >= 0; i--) {
-    String message = loraTransmissionQueue[i];
-    // Extract messageID from the message (assuming the format "messageID|...")
+  if (!loraTransmissionQueue.empty()) {
+    String message = loraTransmissionQueue.front();
     int separatorIndex = message.indexOf('|');
-    if (separatorIndex == -1) continue;
-    String messageID = message.substring(0, separatorIndex);
-    
-    // Look up the transmission status for this message
-    auto it = messageTransmissions.find(messageID);
-    if (it != messageTransmissions.end()) {
-      // Remove from queue if the message is already relayed...
-      // OR if it has been pending longer than pendingTxTimeout.
-      if (it->second.relayedViaLoRa || (now - it->second.timestamp > pendingTxTimeout)) {
-        Serial.printf("[Cleanup] Removing pending message %s from queue (stale or already relayed).\n", messageID.c_str());
-        loraTransmissionQueue.erase(loraTransmissionQueue.begin() + i);
-        // Reset the queued flag so that future scheduling is possible.
-        it->second.queuedForLoRa = false;
+    if (separatorIndex != -1) {
+      String messageID = message.substring(0, separatorIndex);
+      auto it = messageTransmissions.find(messageID);
+      if (it != messageTransmissions.end()) {
+        // Only check the head message’s timer.
+        if (now - it->second.timestamp > pendingTxTimeout) {
+          Serial.printf("[Cleanup] Removing pending message %s from queue (stale).\n", messageID.c_str());
+          loraTransmissionQueue.erase(loraTransmissionQueue.begin());
+          it->second.queuedForLoRa = false;
+          // Update the timestamp of the new head (if any) as it is now active.
+          if (!loraTransmissionQueue.empty()) {
+            int sep = loraTransmissionQueue.front().indexOf('|');
+            if (sep != -1) {
+              String newMessageID = loraTransmissionQueue.front().substring(0, sep);
+              messageTransmissions[newMessageID].timestamp = millis();
+            }
+          }
+        }
+      } else {
+        loraTransmissionQueue.erase(loraTransmissionQueue.begin());
       }
-    } else {
-      // If we have no record for this message, remove it.
-      loraTransmissionQueue.erase(loraTransmissionQueue.begin() + i);
     }
   }
 }
@@ -431,9 +443,9 @@ void scheduleLoRaTransmission(String message) {
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
         loraTransmissionQueue.push_back(updatedMessage);
         status.queuedForLoRa = true;
-        if (loraTransmissionQueue.size() == 1) {
-          // Use a random delay to avoid collisions when relaying others' messages.
-          loRaTransmitDelay = millis() + random(1201, 5000);
+        if (loraTransmissionQueue.size() == 1) { // MODIFIED: New head so start its timer.
+          loRaTransmitDelay = millis() + random(2000, 15000);
+          status.timestamp = millis(); // start timer now
         }
         Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
                       newRelayID.c_str(), loRaTransmitDelay - millis(), updatedMessage.c_str());
@@ -441,9 +453,9 @@ void scheduleLoRaTransmission(String message) {
         // This is the originator. Schedule the original message for transmission.
         loraTransmissionQueue.push_back(message);
         status.queuedForLoRa = true;
-        if (loraTransmissionQueue.size() == 1) {
-          // For originated messages, we want immediate transmission.
+        if (loraTransmissionQueue.size() == 1) { // MODIFIED: New head so start its timer.
           loRaTransmitDelay = millis();  // Immediate transmission for originated messages
+          status.timestamp = millis(); // start timer now
         }
         Serial.printf("[LoRa Schedule] Scheduled original message immediately: %s\n",
                       message.c_str());
@@ -673,8 +685,8 @@ void transmitWithDutyCycle(const String& message) {
       radio.startReceive();  
       rxCheckStart = 0;  // Reset timer.
     } else {
-      Serial.println("[LoRa Tx] Radio busy. Delaying transmission by 500ms.");
-      loRaTransmitDelay = millis() + 500;
+      Serial.println("[LoRa Tx] Radio busy. Delaying transmission by 700ms.");
+      loRaTransmitDelay = millis() + 700;
       return;
     }
   } else {
@@ -695,7 +707,12 @@ void transmitWithDutyCycle(const String& message) {
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
       if (!loraTransmissionQueue.empty()) {
-        loRaTransmitDelay = millis() + random(1201, 5000);
+        loRaTransmitDelay = millis() + random(2000, 15000);
+        int sep = loraTransmissionQueue.front().indexOf('|');
+        if (sep != -1) {
+          String newMessageID = loraTransmissionQueue.front().substring(0, sep);
+          messageTransmissions[newMessageID].timestamp = millis();
+        }
       }
     }
     return;
@@ -728,10 +745,19 @@ void transmitWithDutyCycle(const String& message) {
     // After successful transmission, remove the message from the queue.
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
+      // MODIFIED: If a new message is now at the head, start its timer.
+      if (!loraTransmissionQueue.empty()) {
+        loRaTransmitDelay = millis() + random(2000, 10000);
+        int sep = loraTransmissionQueue.front().indexOf('|');
+        if (sep != -1) {
+          String newMessageID = loraTransmissionQueue.front().substring(0, sep);
+          messageTransmissions[newMessageID].timestamp = millis();
+        }
+      }
     }
     // If more messages remain, schedule the next transmission.
     if (!loraTransmissionQueue.empty()) {
-      loRaTransmitDelay = millis() + random(1201, 5000);
+      loRaTransmitDelay = millis() + random(2000, 10000);
     }
   } else {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
@@ -1109,52 +1135,46 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
                   Serial.println("[LoRa Nodes] RelayID is own node, not updating.");
                 }
 
-// Only update indirect nodes if the originator hasn't been seen directly within the last 15 minutes.
-if (originatorID != myId && relayID != myId && relayID != originatorID) {
-  const uint64_t ACTIVE_THRESHOLD = 960000; // 16 minutes in milliseconds
+                // Only update indirect nodes if the originator hasn't been seen directly within the last 15 minutes.
+                if (originatorID != myId && relayID != myId && relayID != originatorID) {
+                  const uint64_t ACTIVE_THRESHOLD = 960000; // 16 minutes in milliseconds
 
-  bool seenDirectly = false;
-  auto directIt = loraNodes.find(originatorID);
-  if (directIt != loraNodes.end()) {
-      // The node is in the direct list; check if it was seen recently.
-      if (millis() - directIt->second.lastSeen <= ACTIVE_THRESHOLD) {
-          seenDirectly = true;
-      }
-  }
+                  bool seenDirectly = false;
+                  auto directIt = loraNodes.find(originatorID);
+                  if (directIt != loraNodes.end() && (millis() - directIt->second.lastSeen <= ACTIVE_THRESHOLD)) {
+                      seenDirectly = true;
+                  }
 
-  if (seenDirectly) {
-      Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it was seen directly within the last 15 minutes.\n", originatorID.c_str());
-  } else {
-      // Proceed with adding/updating the indirect node record
-      uint64_t currentTime = millis();
-      NodeMetricsSample sample = { currentTime, rssi, snr };
-      String key = originatorID + "-" + relayID; // Composite key for separate relay entries
-      auto it = indirectNodes.find(key);
-      if (it != indirectNodes.end()) {
-          // Update existing indirect node entry
-          it->second.lastSeen = currentTime;
-          it->second.rssi = rssi;
-          it->second.snr = snr;
-          it->second.history.push_back(sample);
-          if (it->second.history.size() > 60) {
-              it->second.history.erase(it->second.history.begin());
-          }
-      } else {
-          // Create a new indirect node entry
-          IndirectNode indNode;
-          indNode.originatorId = originatorID;
-          indNode.relayId = relayID;
-          indNode.rssi = rssi;
-          indNode.snr = snr;
-          indNode.lastSeen = currentTime;
-          indNode.statusEmoji = "🛰️";
-          indNode.history.push_back(sample);
-          indirectNodes[key] = indNode;
-      }
-      Serial.printf("[Indirect Nodes] Updated indirect node: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
-                    originatorID.c_str(), relayID.c_str(), rssi, snr);
-  }
-}
+                  if (seenDirectly) {
+                      Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it was seen directly within the last 15 minutes.\n", originatorID.c_str());
+                  } else {
+                      uint64_t currentTime = millis();
+                      NodeMetricsSample sample = { currentTime, rssi, snr };
+                      String key = originatorID + "-" + relayID; // Composite key for separate relay entries
+                      auto it = indirectNodes.find(key);
+                      if (it != indirectNodes.end()) {
+                          it->second.lastSeen = currentTime;
+                          it->second.rssi = rssi;
+                          it->second.snr = snr;
+                          it->second.history.push_back(sample);
+                          if (it->second.history.size() > 60) {
+                              it->second.history.erase(it->second.history.begin());
+                          }
+                      } else {
+                          IndirectNode indNode;
+                          indNode.originatorId = originatorID;
+                          indNode.relayId = relayID;
+                          indNode.rssi = rssi;
+                          indNode.snr = snr;
+                          indNode.lastSeen = currentTime;
+                          indNode.statusEmoji = "🛰️";
+                          indNode.history.push_back(sample);
+                          indirectNodes[key] = indNode;
+                      }
+                      Serial.printf("[Indirect Nodes] Updated indirect node: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
+                                    originatorID.c_str(), relayID.c_str(), rssi, snr);
+                  }
+                }
               }
             }
           }
@@ -1204,7 +1224,7 @@ void initMesh() {
 }
 
 void receivedCallback(uint32_t from, String& message) {
-  Serial.printf("[WiFi Rx] From %u: %s\n", from, message.c_str());
+  Serial.printf("[WiFi Rx] From %s: %s\n", getCustomNodeId(from).c_str(), message.c_str());
 
   int lastSeparatorIndex = message.lastIndexOf('|');
   if (lastSeparatorIndex == -1) {
@@ -1224,11 +1244,11 @@ void receivedCallback(uint32_t from, String& message) {
     Serial.println("[WiFi Rx] CRC valid.");
   }
 
-      // Skip both plain and aggregated heartbeat messages in WiFi.
-    if (messageWithoutCRC.startsWith("HEARTBEAT|") || messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-        Serial.println("[WiFi Rx] Skipping heartbeat relay over WiFi.");
-        return;
-    }
+  // Skip both plain and aggregated heartbeat messages in WiFi.
+  if (messageWithoutCRC.startsWith("HEARTBEAT|") || messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+    Serial.println("[WiFi Rx] Skipping heartbeat relay over WiFi.");
+    return;
+  }
 
   // --- Only accept messages from our system ---
 // For non-heartbeat messages, verify that the first token (messageID) starts with "!M"
@@ -1436,169 +1456,177 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
       text-decoration: underline;
     }
   </style>
-  <script>
-    let deviceCurrentTime = 0;
-    function sendMessage(event) {
-      event.preventDefault();
+<script>
+  let deviceCurrentTime = 0;
 
-      const nameInput = document.getElementById('nameInput');
-      const targetInput = document.getElementById('targetInput');
-      const messageInput = document.getElementById('messageInput');
-      const sendButton = document.getElementById('sendButton');
+  function sendMessage(event) {
+    event.preventDefault();
 
-      const sender = nameInput.value;  
-      const target = targetInput.value;  
-      const msg = messageInput.value;  
+    const nameInput = document.getElementById('nameInput');
+    const targetInput = document.getElementById('targetInput');
+    const messageInput = document.getElementById('messageInput');
+    const sendButton = document.getElementById('sendButton');
 
-      if (!sender || !msg) {
-        alert('Please enter both a name and a message.');
-        return;
+    const sender = nameInput.value;
+    const target = targetInput.value;
+    const msg = messageInput.value;
+
+    if (!sender || !msg) {
+      alert('Please enter both a name and a message.');
+      return;
+    }
+
+    localStorage.setItem('username', sender);
+
+    const formData = new URLSearchParams();
+    formData.append('sender', sender);
+    formData.append('msg', msg);
+    formData.append('target', target);
+
+    // Disable the send button and start a 15-second countdown
+    sendButton.disabled = true;
+    let countdown = 15;
+    sendButton.value = `Wait ${countdown}s`;
+
+    const countdownInterval = setInterval(() => {
+      countdown--;
+      sendButton.value = `Wait ${countdown}s`;
+      if (countdown <= 0) {
+        clearInterval(countdownInterval);
+        sendButton.disabled = false;
+        sendButton.value = 'Send';
       }
+    }, 1000);
 
-      localStorage.setItem('username', sender);
-
-      const formData = new URLSearchParams();
-      formData.append('sender', sender);
-      formData.append('msg', msg);
-      formData.append('target', target);
-
-      sendButton.disabled = true;
-      sendButton.value = 'Wait 15s';
-
-      fetch('/update', {
-        method: 'POST',
-        body: formData
-      })
+    // Send the message via a POST fetch request
+    fetch('/update', {
+      method: 'POST',
+      body: formData
+    })
       .then(response => {
         if (!response.ok) throw new Error('Failed to send message');
+        // On success, clear inputs and refresh messages
         messageInput.value = '';
         targetInput.value = '';
         fetchData();
-
-        setTimeout(() => {
-          sendButton.disabled = false;
-          sendButton.value = 'Send';
-        }, 15000);
+        // The countdown will finish naturally.
       })
       .catch(error => {
         console.error('Error sending message:', error);
+        clearInterval(countdownInterval);  // Stop the countdown if an error occurs
         sendButton.disabled = false;
         sendButton.value = 'Send';
         alert('Failed to send message. Please try again.');
       });
-    }
+  }
 
-    function fetchData() {
-      fetch('/messages')
-        .then(response => response.json())
-        .then(data => {
-          deviceCurrentTime = data.currentDeviceTime;
+  function fetchData() {
+    fetch('/messages')
+      .then(response => response.json())
+      .then(data => {
+        deviceCurrentTime = data.currentDeviceTime;
+        const ul = document.getElementById('messageList');
+        ul.innerHTML = '';
+        const currentNodeId = localStorage.getItem('nodeId');
 
-          const ul = document.getElementById('messageList');
-          ul.innerHTML = '';
+        data.messages.forEach(msg => {
+          // Filter out private messages not meant for this node.
+          if (msg.recipient && msg.recipient !== "ALL" &&
+              msg.nodeId !== currentNodeId && msg.recipient !== currentNodeId) {
+            return;
+          }
 
-          const currentNodeId = localStorage.getItem('nodeId');
-
-          data.messages.forEach(msg => {
-            // Filter out private messages not meant for this node.
-            if (msg.recipient && msg.recipient !== "ALL" &&
-                msg.nodeId !== currentNodeId && msg.recipient !== currentNodeId) {
-              return;
-            }
-
-            const li = document.createElement('li');
-            li.classList.add('message');
-
-            const isSentByCurrentNode = msg.nodeId === currentNodeId;
-            if (isSentByCurrentNode) {
-              li.classList.add('sent');
+          const li = document.createElement('li');
+          li.classList.add('message');
+          const isSentByCurrentNode = msg.nodeId === currentNodeId;
+          if (isSentByCurrentNode) {
+            li.classList.add('sent');
+          } else {
+            li.classList.add('received');
+            if (msg.source === '[LoRa]') {
+              li.classList.add('lora');
             } else {
-              li.classList.add('received');
-              if (msg.source === '[LoRa]') {
-                li.classList.add('lora');
-              } else {
-                li.classList.add('wifi');
-              }
+              li.classList.add('wifi');
             }
+          }
 
-            const messageAgeMillis = deviceCurrentTime - msg.timeReceived;
-            const messageAgeSeconds = Math.floor(messageAgeMillis / 1000);
-            let timestamp = '';
-            if (messageAgeSeconds < 60) {
-              timestamp = `${messageAgeSeconds} sec ago`;
-            } else if (messageAgeSeconds < 3600) {
-              const minutes = Math.floor(messageAgeSeconds / 60);
-              timestamp = `${minutes} min ago`;
-            } else if (messageAgeSeconds < 86400) {
-              const hours = Math.floor(messageAgeSeconds / 3600);
-              const minutes = Math.floor((messageAgeSeconds % 3600) / 60);
-              timestamp = minutes > 0 ? `${hours} hr ${minutes} min ago` : `${hours} hr ago`;
-            } else if (messageAgeSeconds < 604800) {
-              const days = Math.floor(messageAgeSeconds / 86400);
-              timestamp = `${days} day${days > 1 ? 's' : ''} ago`;
-            } else if (messageAgeSeconds < 2592000) {
-              const weeks = Math.floor(messageAgeSeconds / 604800);
-              timestamp = `${weeks} week${weeks > 1 ? 's' : ''} ago`;
-            } else if (messageAgeSeconds < 31536000) {
-              const months = Math.floor(messageAgeSeconds / 2592000);
-              timestamp = `${months} month${months > 1 ? 's' : ''} ago`;
-            } else {
-              const years = Math.floor(messageAgeSeconds / 31536000);
-              timestamp = `${years} year${years > 1 ? 's' : ''} ago`;
-            }
+          const messageAgeMillis = deviceCurrentTime - msg.timeReceived;
+          const messageAgeSeconds = Math.floor(messageAgeMillis / 1000);
+          let timestamp = '';
+          if (messageAgeSeconds < 60) {
+            timestamp = `${messageAgeSeconds} sec ago`;
+          } else if (messageAgeSeconds < 3600) {
+            const minutes = Math.floor(messageAgeSeconds / 60);
+            timestamp = `${minutes} min ago`;
+          } else if (messageAgeSeconds < 86400) {
+            const hours = Math.floor(messageAgeSeconds / 3600);
+            const minutes = Math.floor((messageAgeSeconds % 3600) / 60);
+            timestamp = minutes > 0 ? `${hours} hr ${minutes} min ago` : `${hours} hr ago`;
+          } else if (messageAgeSeconds < 604800) {
+            const days = Math.floor(messageAgeSeconds / 86400);
+            timestamp = `${days} day${days > 1 ? 's' : ''} ago`;
+          } else if (messageAgeSeconds < 2592000) {
+            const weeks = Math.floor(messageAgeSeconds / 604800);
+            timestamp = `${weeks} week${weeks > 1 ? 's' : ''} ago`;
+          } else if (messageAgeSeconds < 31536000) {
+            const months = Math.floor(messageAgeSeconds / 2592000);
+            timestamp = `${months} month${months > 1 ? 's' : ''} ago`;
+          } else {
+            const years = Math.floor(messageAgeSeconds / 31536000);
+            timestamp = `${years} year${years > 1 ? 's' : ''} ago`;
+          }
 
-            const nodeIdHtml = `Node Id: ${msg.nodeId}`;
-            const senderHtml = `<strong>${msg.sender || 'Unknown'}:</strong> `;
-            let privateIndicator = "";
-            if (msg.recipient && msg.recipient !== "ALL") {
-              privateIndicator = `<span style="color:red;">[Private to ${msg.recipient}]</span> `;
-            }
-            
-            // NEW: Build the RSSI/SNR line if this is a LoRa message
-            let rssiSnrHtml = "";
-            if (msg.source === "[LoRa]" && msg.rssi !== undefined && msg.snr !== undefined) {
-              rssiSnrHtml = `<span class="message-rssi-snr">RSSI: ${msg.rssi} dBm, SNR: ${msg.snr} dB</span>`;
-            }
+          const nodeIdHtml = `Node Id: ${msg.nodeId}`;
+          const senderHtml = `<strong>${msg.sender || 'Unknown'}:</strong> `;
+          let privateIndicator = "";
+          if (msg.recipient && msg.recipient !== "ALL") {
+            privateIndicator = `<span style="color:red;">[Private to ${msg.recipient}]</span> `;
+          }
 
-let relayHtml = "";
-if (!isSentByCurrentNode) {  // Only show Relay Id if the message wasn't sent by the current node
-  relayHtml = `<span class="message-relayid">Relay Id: ${msg.relayID}</span>`;
-}
+          let rssiSnrHtml = "";
+          if (msg.source === "[LoRa]" && msg.rssi !== undefined && msg.snr !== undefined) {
+            rssiSnrHtml = `<span class="message-rssi-snr">RSSI: ${msg.rssi} dBm, SNR: ${msg.snr} dB</span>`;
+          }
 
-li.innerHTML = `
-  <span class="message-nodeid">${nodeIdHtml}</span>
-  <div class="message-content">${senderHtml}${privateIndicator}${msg.content}</div>
-  ${relayHtml}
-  <span class="message-time">${timestamp}</span>
-  ${rssiSnrHtml}
-`;
-            ul.appendChild(li);
-          });
+          let relayHtml = "";
+          if (!isSentByCurrentNode) {
+            relayHtml = `<span class="message-relayid">Relay Id: ${msg.relayID}</span>`;
+          }
 
-          ul.scrollTop = ul.scrollHeight;
-        })
-        .catch(error => console.error('Error fetching messages:', error));
+          li.innerHTML = `
+            <span class="message-nodeid">${nodeIdHtml}</span>
+            <div class="message-content">${senderHtml}${privateIndicator}${msg.content}</div>
+            ${relayHtml}
+            <span class="message-time">${timestamp}</span>
+            ${rssiSnrHtml}
+          `;
+          ul.appendChild(li);
+        });
 
-      fetch('/deviceCount')
-        .then(response => response.json())
-        .then(data => {
-          localStorage.setItem('nodeId', data.nodeId);
-          document.getElementById('deviceCount').innerHTML = 
-            `Mesh Nodes: <a href="/nodes">${data.totalCount}</a>, Node ID: ${data.nodeId}`;
-        })
-        .catch(error => console.error('Error fetching device count:', error));
+        ul.scrollTop = ul.scrollHeight;
+      })
+      .catch(error => console.error('Error fetching messages:', error));
+
+    fetch('/deviceCount')
+      .then(response => response.json())
+      .then(data => {
+        localStorage.setItem('nodeId', data.nodeId);
+        document.getElementById('deviceCount').innerHTML =
+          `Mesh Nodes: <a href="/nodes">${data.totalCount}</a>, Node ID: ${data.nodeId}`;
+      })
+      .catch(error => console.error('Error fetching device count:', error));
+  }
+
+  window.onload = function() {
+    const savedName = localStorage.getItem('username');
+    if (savedName) {
+      document.getElementById('nameInput').value = savedName;
     }
-
-    window.onload = function() {
-      const savedName = localStorage.getItem('username');
-      if (savedName) {
-        document.getElementById('nameInput').value = savedName;
-      }
-      fetchData();
-      setInterval(fetchData, 5000);
-      document.getElementById('messageForm').addEventListener('submit', sendMessage);
-    };
-  </script>
+    fetchData();
+    setInterval(fetchData, 5000);
+    document.getElementById('messageForm').addEventListener('submit', sendMessage);
+  };
+</script>
 </head>
 <body>
   <div class="warning">For your safety, do not share your location or any personal information!</div>
@@ -2143,7 +2171,6 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
   uint64_t ageSec = ageMs / 1000;
@@ -2241,10 +2268,10 @@ server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
     uint64_t lastSeenTime = loraNode.lastSeen;
     if (currentTime - lastSeenTime <= FIFTEEN_MINUTES) {
       if (!firstLora) json += ",";
-      json += "{\"nodeId\":\"" + nodeId + "\","
-            + "\"lastRSSI\":" + String(loraNode.lastRSSI) + ","
-            + "\"lastSNR\":" + String(loraNode.lastSNR, 2) + ","
-            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - lastSeenTime) + "\","
+      json += "{\"nodeId\":\"" + nodeId + "\"," 
+            + "\"lastRSSI\":" + String(loraNode.lastRSSI) + "," 
+            + "\"lastSNR\":" + String(loraNode.lastSNR, 2) + "," 
+            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - lastSeenTime) + "\"," 
             + "\"statusEmoji\":\"" + loraNode.statusEmoji + "\"}";
       firstLora = false;
     }
@@ -2258,11 +2285,11 @@ server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
     const auto &node = kv.second;
     if (currentTime - node.lastSeen <= THIRTY_ONE_MINUTES) {
       if (!firstIndirect) json += ",";
-      json += "{\"originatorId\":\"" + node.originatorId + "\","
-            + "\"relayId\":\"" + node.relayId + "\","
-            + "\"rssi\":" + String(node.rssi) + ","
-            + "\"snr\":" + String(node.snr, 2) + ","
-            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\","
+      json += "{\"originatorId\":\"" + node.originatorId + "\"," 
+            + "\"relayId\":\"" + node.relayId + "\"," 
+            + "\"rssi\":" + String(node.rssi) + "," 
+            + "\"snr\":" + String(node.snr, 2) + "," 
+            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\"," 
             + "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
       firstIndirect = false;
     }
@@ -2528,11 +2555,32 @@ void updateMeshData() {
 }
 
 int getNodeCount() {
-  return totalNodeCount;
-}
+  std::set<String> uniqueNodes;  // a set to hold unique node IDs
+  uint64_t now = millis();
 
-uint32_t getNodeId() {
-  return currentNodeId;
+  // 1. Add WiFi (mesh) nodes.
+  auto wifiNodes = mesh.getNodeList();
+  for (uint32_t id : wifiNodes) {
+    uniqueNodes.insert(getCustomNodeId(id));
+  }
+
+  // 2. Add direct LoRa nodes (only if seen in the last 16 minutes).
+  const uint64_t DIRECT_THRESHOLD = 16UL * 60UL * 1000UL;
+  for (auto const &entry : loraNodes) {
+    if (now - entry.second.lastSeen <= DIRECT_THRESHOLD) {
+      uniqueNodes.insert(entry.first);
+    }
+  }
+
+  // 3. Add indirect nodes (using the originatorId) if seen in the last 31 minutes.
+  const uint64_t INDIRECT_THRESHOLD = 1860000;
+  for (auto const &entry : indirectNodes) {
+    if (now - entry.second.lastSeen <= INDIRECT_THRESHOLD) {
+      uniqueNodes.insert(entry.second.originatorId);
+    }
+  }
+
+  return uniqueNodes.size();
 }
 
 void initServer() {
