@@ -6,6 +6,7 @@
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //nodes we could see direct was still showing as indirect when reciving agg heartbeat. seems ok now.
+//added relay id to recived messages from lora so you will see a relay id.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -1561,6 +1562,7 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
             li.innerHTML = `
               <span class="message-nodeid">${nodeIdHtml}</span>
               <div class="message-content">${senderHtml}${privateIndicator}${msg.content}</div>
+              <span class="message-relayid">Relay Id: ${msg.relayID}</span>
               <span class="message-time">${timestamp}</span>
               ${rssiSnrHtml}
             `;
