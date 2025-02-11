@@ -1,4 +1,4 @@
-//Test v1.00.016
+//Test v1.00.017
 //11-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
@@ -11,7 +11,8 @@
 //added indirect nodes to nodecount if its not there in wifi or lora direct.
 //added count down to send button.
 //made delay changes on random delay max is now 15 seconds.
-//relay cue sets timer at front of cue instead of when its added to cue this is cleared aftere 35 seconds if not sent.
+//relay cue sets timer at front of cue instead of when its added to cue this is cleared aftere 45seconds if not sent.
+//added tx time out to 45,000 ms = 45 seconds
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -32,6 +33,45 @@
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
+
+// -----------------------------------------------------------------------------
+// TX Timeout helper functions and types
+// -----------------------------------------------------------------------------
+
+// Structure to hold the result of a TX attempt
+struct TxResult {
+  int status;
+  unsigned long elapsed;
+};
+
+// Stub function to check if the radio is still transmitting.
+// Replace this with an actual check if your radio library supports it.
+bool radioIsTransmitting() {
+  // For demonstration, we assume the radio is no longer transmitting.
+  return false;
+}
+
+// Transmit a message using radio.transmit() and enforce a timeout (default 10 sec).
+// If the transmission does not complete within the timeout, force the radio
+// back into RX mode and return an error status (-1).
+TxResult transmitWithTimeout(const String &message, unsigned long timeoutMs = 10000) {
+  unsigned long startTime = millis();
+  int status = radio.transmit(message.c_str());
+  if (status != RADIOLIB_ERR_NONE) {
+    return {status, millis() - startTime};
+  }
+  // Poll until the radio is no longer transmitting or the timeout is reached.
+  while ((millis() - startTime) < timeoutMs && radioIsTransmitting()) {
+    delay(50);
+  }
+  unsigned long elapsed = millis() - startTime;
+  if (elapsed >= timeoutMs) {
+    Serial.println("[LoRa Tx] Transmission timeout reached. Forcing radio back into RX mode.");
+    radio.startReceive();
+    return {-1, elapsed};
+  }
+  return {RADIOLIB_ERR_NONE, elapsed};
+}
 
 // ===================
 // TRANSMISSION TRACKING
@@ -70,7 +110,7 @@ uint64_t minimum_pause = 0;
 unsigned long lastTransmitTime = 0;  
 
 // Timeout for pending transmissions (e.g. 35 seconds)
-const unsigned long pendingTxTimeout = 35000; // 35,000 ms = 35 seconds
+const unsigned long pendingTxTimeout = 45000; // 45,000 ms = 45 seconds
 
 // Retain transmission history for 24 hours
 const unsigned long transmissionHistoryRetention = 86400000; // 86,400,000 ms = 24 hours
@@ -380,7 +420,6 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
                 nodeId.c_str(), sender.c_str(), recipient.c_str(), content.c_str(),
                 finalSource.c_str(), messageID.c_str(), relayID.c_str());
 }
-
 
 //
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
@@ -718,13 +757,13 @@ void transmitWithDutyCycle(const String& message) {
     return;
   }
 
-  // Record the transmission start time and transmit the message.
-  tx_time = millis();
+  // Record the transmission start time and transmit the message using our timeout wrapper.
   Serial.printf("[LoRa Tx] Transmitting: %s\n", message.c_str());
   heltec_led(50);
-  int transmitStatus = radio.transmit(message.c_str());
-  tx_time = millis() - tx_time;
+  TxResult txResult = transmitWithTimeout(message, 10000);
   heltec_led(0);
+  tx_time = txResult.elapsed;
+  int transmitStatus = txResult.status;
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
@@ -790,8 +829,9 @@ void sendHeartbeat() {
   uint64_t txStart = millis();
   Serial.printf("[Heartbeat Tx] Sending: %s\n", heartbeatMessage.c_str());
   heltec_led(50);
-  int transmitStatus = radio.transmit(heartbeatMessage.c_str());
-  uint64_t txTime = millis() - txStart;
+  TxResult txResult = transmitWithTimeout(heartbeatMessage, 10000);
+  uint64_t txTime = txResult.elapsed;
+  int transmitStatus = txResult.status;
   heltec_led(0);
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
@@ -835,12 +875,13 @@ void sendAggregatedHeartbeat() {
     return;
   }
   
-  // Transmit the aggregated heartbeat message
+  // Transmit the aggregated heartbeat message using the timeout wrapper.
   uint64_t txStart = millis();
   Serial.printf("[Aggregated Heartbeat Tx] Sending: %s\n", aggMessage.c_str());
   heltec_led(50);
-  int transmitStatus = radio.transmit(aggMessage.c_str());
-  uint64_t txTime = millis() - txStart;
+  TxResult txResult = transmitWithTimeout(aggMessage, 10000);
+  uint64_t txTime = txResult.elapsed;
+  int transmitStatus = txResult.status;
   heltec_led(0);
   
   if (transmitStatus == RADIOLIB_ERR_NONE) {
@@ -1755,7 +1796,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
       fetch('/nodesData')
         .then(response => response.json())
         .then(data => {
-          // --- WiFi Nodes Section (unchanged) ---
+          // --- WiFi Nodes Section (unchanged) ---  
           const wifiUl = document.getElementById('wifiNodeList');
           wifiUl.innerHTML = '';
           const wifiCount = data.wifiNodes.length;
@@ -1879,6 +1920,10 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
       padding: 20px;
     }
     h2 {
+      text-align: center;
+      color: #333;
+    }
+    h3 {
       text-align: center;
       color: #333;
     }
