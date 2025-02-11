@@ -1,15 +1,11 @@
-//Test v1.00.014
-//10-02-2025
+//Test v1.00.015
+//11-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//Hopefully every 31 mins you will see indirect 1 hop nodes from heartbeat aswell as if a message passes through our system with ANY hop. (if the network gets busy this update time will be longer.)
-//Wifi was relaying agg heartbeats now its fixed.
-//indirect node timer was off it should have been ovee 30 mins since last seen so we dont see our own nodes as indirect.
-//agg was sending all nodes not just lora. causing problems.
-//nodelist removes indirect nodes after 31 mins.
+//nodes we could see direct was still showing as indirect when reciving agg heartbeat. seems ok now.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -78,6 +74,9 @@ std::vector<String> loraTransmissionQueue;
 // Aggregated Heartbeat Interval: 31 minutes (31 * 60 * 1000 = 1,860,000 ms)
 const unsigned long aggregatedHeartbeatInterval = 1860000;
 unsigned long lastAggregatedHeartbeatTime = 0;
+
+// Define a constant for the direct node timeout (16 minutes)
+const uint64_t DIRECT_NODE_TIMEOUT = 16UL * 60UL * 1000UL; // 16 minutes in milliseconds
 
 // Duty Cycle Definitions and Variables
 #define DUTY_CYCLE_LIMIT_MS 360000   // 6 minutes in a 60-minute window
@@ -859,12 +858,6 @@ void setup() {
   RADIOLIB_OR_HALT(radio.setCodingRate(CODING_RATE));
   RADIOLIB_OR_HALT(radio.setOutputPower(TRANSMIT_POWER));
 
-  // Disable hardware CRC so that only our manual CRC is used.
-  //radio.setCRC(false);
-
-  //  -- Set your unique sync word here --
-  // radio.setSyncWord(0x12);  // e.g., 0x12
-
   radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF);
   delay(2000);
 
@@ -981,82 +974,75 @@ void loop() {
             }
           }
           // --- Aggregated Heartbeat Handling ---
-          else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-            Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
-            // Expected format: AGG_HEARTBEAT|<relayID>|<originatorID1>|<originatorID2>|...
-            int firstSep = messageWithoutCRC.indexOf('|');
-            if (firstSep == -1) {
-              Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
-            } else {
-              int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);
-              String senderRelayId;
-              if (secondSep == -1) {
-                senderRelayId = messageWithoutCRC.substring(firstSep + 1);
-              } else {
-                senderRelayId = messageWithoutCRC.substring(firstSep + 1, secondSep);
-              }
-              // Process each originator ID listed (if any)
-              int startPos = secondSep + 1;
-              while (true) {
-                int nextSep = messageWithoutCRC.indexOf('|', startPos);
-                String originatorId;
-                if (nextSep == -1) {
-                  originatorId = messageWithoutCRC.substring(startPos);
-                } else {
-                  originatorId = messageWithoutCRC.substring(startPos, nextSep);
-                }
-                if (originatorId.length() > 0) {
-                  // Check if the originator is already in the WiFi mesh network
-                  auto wifiNodes = mesh.getNodeList();  // Use auto instead of std::vector
-                  bool isWiFiNode = false;
-                  for (uint32_t node : wifiNodes) {
-                    if (getCustomNodeId(node) == originatorId) {
-                      isWiFiNode = true;
-                      break;
-                    }
-                  }
-                  if (isWiFiNode) {
-                    Serial.printf("[Indirect Nodes] Skipped aggregated indirect update for %s because it's a WiFi node (treated as direct).\n", originatorId.c_str());
-                  } else {
-                    // Only update if the originator is not in direct LoRa nodes
-                    if (loraNodes.find(originatorId) == loraNodes.end()) {
-                      uint64_t currentTime = millis();
-                      int rssi = radio.getRSSI();
-                      float snr = radio.getSNR();
-                      NodeMetricsSample sample = { currentTime, rssi, snr };
-                      String key = originatorId + "-" + senderRelayId; // Composite key
-                      auto it = indirectNodes.find(key);
-                      if (it != indirectNodes.end()) {
-                        // Update existing entry
-                        it->second.lastSeen = currentTime;
-                        it->second.rssi = rssi;
-                        it->second.snr = snr;
-                        it->second.history.push_back(sample);
-                        if (it->second.history.size() > 60) {
-                          it->second.history.erase(it->second.history.begin());
-                        }
-                      } else {
-                        // Create new indirect node entry
-                        IndirectNode indNode;
-                        indNode.originatorId = originatorId;
-                        indNode.relayId = senderRelayId;
-                        indNode.rssi = rssi;
-                        indNode.snr = snr;
-                        indNode.lastSeen = currentTime;
-                        indNode.statusEmoji = "🛰️";
-                        indNode.history.push_back(sample);
-                        indirectNodes[key] = indNode;
-                      }
-                      Serial.printf("[Indirect Nodes] Updated via Aggregated Heartbeat: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
-                                    originatorId.c_str(), senderRelayId.c_str(), rssi, snr);
-                    }
-                  }
-                }
-                if (nextSep == -1) break;
-                startPos = nextSep + 1;
-              }
+else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+  Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
+  int firstSep = messageWithoutCRC.indexOf('|');
+  if (firstSep == -1) {
+    Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
+  } else {
+    // The next token is the sender's relay ID.
+    int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);
+    String senderRelayId;
+    if (secondSep == -1) {
+      senderRelayId = messageWithoutCRC.substring(firstSep + 1);
+    } else {
+      senderRelayId = messageWithoutCRC.substring(firstSep + 1, secondSep);
+    }
+    
+    // Process each subsequent token as an originator ID from the sender's direct node list.
+    int startPos = secondSep + 1;
+    while (true) {
+      int nextSep = messageWithoutCRC.indexOf('|', startPos);
+      String originatorId;
+      if (nextSep == -1) {
+        originatorId = messageWithoutCRC.substring(startPos);
+      } else {
+        originatorId = messageWithoutCRC.substring(startPos, nextSep);
+      }
+      
+      // Only process non-empty originator IDs that are not our own.
+      if (originatorId.length() > 0 && originatorId != getCustomNodeId(getNodeId())) {
+        // Check if we have seen this node directly within the DIRECT_NODE_TIMEOUT period.
+        auto directIt = loraNodes.find(originatorId);
+        if (directIt != loraNodes.end() && (millis() - directIt->second.lastSeen) <= DIRECT_NODE_TIMEOUT) {
+          Serial.printf("[Indirect Nodes] Skipped aggregated indirect update for %s (seen directly)\n", originatorId.c_str());
+        } else {
+          // Not seen directly recently: add or update the indirect node record.
+          uint64_t currentTime = millis();
+          int rssi = radio.getRSSI();
+          float snr = radio.getSNR();
+          NodeMetricsSample sample = { currentTime, rssi, snr };
+          String key = originatorId + "-" + senderRelayId; // composite key for indirect node
+          auto it = indirectNodes.find(key);
+          if (it != indirectNodes.end()) {
+            it->second.lastSeen = currentTime;
+            it->second.rssi = rssi;
+            it->second.snr = snr;
+            it->second.history.push_back(sample);
+            if (it->second.history.size() > 60) {
+              it->second.history.erase(it->second.history.begin());
             }
+          } else {
+            IndirectNode indNode;
+            indNode.originatorId = originatorId;
+            indNode.relayId = senderRelayId;
+            indNode.rssi = rssi;
+            indNode.snr = snr;
+            indNode.lastSeen = currentTime;
+            indNode.statusEmoji = "🛰️";
+            indNode.history.push_back(sample);
+            indirectNodes[key] = indNode;
           }
+          Serial.printf("[Indirect Nodes] Updated via Aggregated Heartbeat: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
+                        originatorId.c_str(), senderRelayId.c_str(), rssi, snr);
+        }
+      }
+      
+      if (nextSep == -1) break;
+      startPos = nextSep + 1;
+    }
+  }
+}
           // --- Non-Heartbeat (Message) Handling ---
           else {
             int firstSeparator = messageWithoutCRC.indexOf('|');
@@ -1123,7 +1109,7 @@ void loop() {
 
 // Only update indirect nodes if the originator hasn't been seen directly within the last 15 minutes.
 if (originatorID != myId && relayID != myId && relayID != originatorID) {
-  const uint64_t ACTIVE_THRESHOLD = 900000; // 15 minutes in milliseconds
+  const uint64_t ACTIVE_THRESHOLD = 960000; // 16 minutes in milliseconds
 
   bool seenDirectly = false;
   auto directIt = loraNodes.find(originatorID);
