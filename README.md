@@ -5,8 +5,8 @@
 <body>
     <div class="container">
         <h1>Welcome to Meshmingle</h1>
-        <p>Meshmingle is a free homebrew mesh chat network that works through WiFi and LoRa to extend range beyond your home.</p>
-        <p>When connected to WiFi via a mobile device, open your browser and go to <a href="http://mesh.local">http://mesh.local</a> to start chatting.</p>
+        <p>Meshmingle is a free homebrew mesh network that works through WiFi and LoRa to extend range beyond your home.</p>
+        <p>When connected to WiFi via a mobile device, open your browser and go to <a href="http://mesh.local">http://mesh.local</a> to start.</p>
         <p>Setup is easy! Just power up your device after flashing, and you're good to go.</p>
         <p>It is recommended to use a Heltec V3 LoRa device and connect it to an external antenna for longer range, although an external antenna is not required if many users are nearby on the same network.</p>
         <p>Each device on the mesh acts as a relay, so any messages sent will relay through all connected devices.</p>
