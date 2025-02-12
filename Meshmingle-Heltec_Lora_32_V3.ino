@@ -1,5 +1,5 @@
-//Test v1.00.017
-//11-02-2025
+//Test v1.00.018
+//12-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
@@ -7,12 +7,12 @@
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //nodes we could see direct was still showing as indirect when reciving agg heartbeat. seems ok now.
 //added relay id to recived messages from lora so you will see a relay id.
-//we could see relay id on sent messages !! thats  fixed.
+//we could see relay id on sent messages !! thats fixed.
 //added indirect nodes to nodecount if its not there in wifi or lora direct.
 //added count down to send button.
-//made delay changes on random delay max is now 15 seconds.
-//relay cue sets timer at front of cue instead of when its added to cue this is cleared aftere 45seconds if not sent.
-//added tx time out to 45,000 ms = 45 seconds
+//changed  so we dont relay messages back through wifi unless from lora.
+//changed random tx time to upto 10 secs
+//had to revert back a few versions i got too far ahead of myself.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -34,44 +34,14 @@
 #include <RadioLib.h>
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
 
-// -----------------------------------------------------------------------------
-// TX Timeout helper functions and types
-// -----------------------------------------------------------------------------
-
-// Structure to hold the result of a TX attempt
-struct TxResult {
-  int status;
-  unsigned long elapsed;
+// ---------------------------------------------------------------------
+// NEW: Define an enum to track the origin of each message
+// ---------------------------------------------------------------------
+enum OriginChannel {
+  ORIGIN_UNKNOWN,
+  ORIGIN_WIFI,
+  ORIGIN_LORA
 };
-
-// Stub function to check if the radio is still transmitting.
-// Replace this with an actual check if your radio library supports it.
-bool radioIsTransmitting() {
-  // For demonstration, we assume the radio is no longer transmitting.
-  return false;
-}
-
-// Transmit a message using radio.transmit() and enforce a timeout (default 10 sec).
-// If the transmission does not complete within the timeout, force the radio
-// back into RX mode and return an error status (-1).
-TxResult transmitWithTimeout(const String &message, unsigned long timeoutMs = 10000) {
-  unsigned long startTime = millis();
-  int status = radio.transmit(message.c_str());
-  if (status != RADIOLIB_ERR_NONE) {
-    return {status, millis() - startTime};
-  }
-  // Poll until the radio is no longer transmitting or the timeout is reached.
-  while ((millis() - startTime) < timeoutMs && radioIsTransmitting()) {
-    delay(50);
-  }
-  unsigned long elapsed = millis() - startTime;
-  if (elapsed >= timeoutMs) {
-    Serial.println("[LoRa Tx] Transmission timeout reached. Forcing radio back into RX mode.");
-    radio.startReceive();
-    return {-1, elapsed};
-  }
-  return {RADIOLIB_ERR_NONE, elapsed};
-}
 
 // ===================
 // TRANSMISSION TRACKING
@@ -83,7 +53,8 @@ struct TransmissionStatus {
   bool relayedViaWiFi = false;     // NEW: whether the message has been relayed via WiFi
   bool relayedViaLoRa = false;     // NEW: whether the message has been relayed via LoRa
   bool queuedForLoRa = false;      // NEW: whether the message is already queued for LoRa transmission
-  uint64_t timestamp = millis();   // record when the message becomes active (modified when it reaches head)
+  OriginChannel origin = ORIGIN_UNKNOWN; // NEW: track the origin (WiFi vs LoRa) of this message
+  uint64_t timestamp = millis();   // record when the entry was created/updated
 };
 
 // Map to track transmissions by message ID
@@ -109,8 +80,8 @@ uint64_t last_tx = 0;
 uint64_t minimum_pause = 0;
 unsigned long lastTransmitTime = 0;  
 
-// Timeout for pending transmissions (e.g. 35 seconds)
-const unsigned long pendingTxTimeout = 45000; // 45,000 ms = 45 seconds
+// Timeout for pending transmissions (e.g. 5 minutes)
+const unsigned long pendingTxTimeout = 150000; // 150,000 ms = 2.5 minutes
 
 // Retain transmission history for 24 hours
 const unsigned long transmissionHistoryRetention = 86400000; // 86,400,000 ms = 24 hours
@@ -302,33 +273,30 @@ void cleanupIndirectNodes() {
   }
 }
 
-// --- MODIFIED: cleanupPendingTxQueue() now checks only the head of the queue and resets its timestamp when a new head appears.
 void cleanupPendingTxQueue() {
   unsigned long now = millis();
-  if (!loraTransmissionQueue.empty()) {
-    String message = loraTransmissionQueue.front();
+  // Iterate over the queue in reverse order so we can remove items safely.
+  for (int i = loraTransmissionQueue.size() - 1; i >= 0; i--) {
+    String message = loraTransmissionQueue[i];
+    // Extract messageID from the message (assuming the format "messageID|...")
     int separatorIndex = message.indexOf('|');
-    if (separatorIndex != -1) {
-      String messageID = message.substring(0, separatorIndex);
-      auto it = messageTransmissions.find(messageID);
-      if (it != messageTransmissions.end()) {
-        // Only check the head message’s timer.
-        if (now - it->second.timestamp > pendingTxTimeout) {
-          Serial.printf("[Cleanup] Removing pending message %s from queue (stale).\n", messageID.c_str());
-          loraTransmissionQueue.erase(loraTransmissionQueue.begin());
-          it->second.queuedForLoRa = false;
-          // Update the timestamp of the new head (if any) as it is now active.
-          if (!loraTransmissionQueue.empty()) {
-            int sep = loraTransmissionQueue.front().indexOf('|');
-            if (sep != -1) {
-              String newMessageID = loraTransmissionQueue.front().substring(0, sep);
-              messageTransmissions[newMessageID].timestamp = millis();
-            }
-          }
-        }
-      } else {
-        loraTransmissionQueue.erase(loraTransmissionQueue.begin());
+    if (separatorIndex == -1) continue;
+    String messageID = message.substring(0, separatorIndex);
+    
+    // Look up the transmission status for this message
+    auto it = messageTransmissions.find(messageID);
+    if (it != messageTransmissions.end()) {
+      // Remove from queue if the message is already relayed...
+      // OR if it has been pending longer than pendingTxTimeout.
+      if (it->second.relayedViaLoRa || (now - it->second.timestamp > pendingTxTimeout)) {
+        Serial.printf("[Cleanup] Removing pending message %s from queue (stale or already relayed).\n", messageID.c_str());
+        loraTransmissionQueue.erase(loraTransmissionQueue.begin() + i);
+        // Reset the queued flag so that future scheduling is possible.
+        it->second.queuedForLoRa = false;
       }
+    } else {
+      // If we have no record for this message, remove it.
+      loraTransmissionQueue.erase(loraTransmissionQueue.begin() + i);
     }
   }
 }
@@ -421,6 +389,7 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
                 finalSource.c_str(), messageID.c_str(), relayID.c_str());
 }
 
+
 //
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
 // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
@@ -482,9 +451,9 @@ void scheduleLoRaTransmission(String message) {
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
         loraTransmissionQueue.push_back(updatedMessage);
         status.queuedForLoRa = true;
-        if (loraTransmissionQueue.size() == 1) { // MODIFIED: New head so start its timer.
-          loRaTransmitDelay = millis() + random(2000, 15000);
-          status.timestamp = millis(); // start timer now
+        if (loraTransmissionQueue.size() == 1) {
+          // Use a random delay to avoid collisions when relaying others' messages.
+          loRaTransmitDelay = millis() + random(1201, 10000);
         }
         Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
                       newRelayID.c_str(), loRaTransmitDelay - millis(), updatedMessage.c_str());
@@ -492,9 +461,9 @@ void scheduleLoRaTransmission(String message) {
         // This is the originator. Schedule the original message for transmission.
         loraTransmissionQueue.push_back(message);
         status.queuedForLoRa = true;
-        if (loraTransmissionQueue.size() == 1) { // MODIFIED: New head so start its timer.
+        if (loraTransmissionQueue.size() == 1) {
+          // For originated messages, we want immediate transmission.
           loRaTransmitDelay = millis();  // Immediate transmission for originated messages
-          status.timestamp = millis(); // start timer now
         }
         Serial.printf("[LoRa Schedule] Scheduled original message immediately: %s\n",
                       message.c_str());
@@ -579,7 +548,7 @@ void showScrollingMonospacedAsciiArt() {
   }
   int totalBlockWidth = maxChars * charWidth;
 
-  if (totalBlockWidth <= screenWidth) {
+if (totalBlockWidth <= screenWidth) {
     int offsetX = (screenWidth - totalBlockWidth) / 2;
     for (int i = 0; i < 5; i++) {
       drawMonospacedLine(offsetX, verticalOffset + i * lineHeight, lines[i], charWidth);
@@ -587,7 +556,7 @@ void showScrollingMonospacedAsciiArt() {
     display.display();
     delay(3000);
     return;
-  }
+}
 
   const int blankStart = 20; 
   const int blankEnd   = 20; 
@@ -724,8 +693,8 @@ void transmitWithDutyCycle(const String& message) {
       radio.startReceive();  
       rxCheckStart = 0;  // Reset timer.
     } else {
-      Serial.println("[LoRa Tx] Radio busy. Delaying transmission by 700ms.");
-      loRaTransmitDelay = millis() + 700;
+      Serial.println("[LoRa Tx] Radio busy. Delaying transmission by 500ms.");
+      loRaTransmitDelay = millis() + 500;
       return;
     }
   } else {
@@ -746,24 +715,19 @@ void transmitWithDutyCycle(const String& message) {
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
       if (!loraTransmissionQueue.empty()) {
-        loRaTransmitDelay = millis() + random(2000, 15000);
-        int sep = loraTransmissionQueue.front().indexOf('|');
-        if (sep != -1) {
-          String newMessageID = loraTransmissionQueue.front().substring(0, sep);
-          messageTransmissions[newMessageID].timestamp = millis();
-        }
+        loRaTransmitDelay = millis() + random(1201, 10000);
       }
     }
     return;
   }
 
-  // Record the transmission start time and transmit the message using our timeout wrapper.
+  // Record the transmission start time and transmit the message.
+  tx_time = millis();
   Serial.printf("[LoRa Tx] Transmitting: %s\n", message.c_str());
   heltec_led(50);
-  TxResult txResult = transmitWithTimeout(message, 10000);
+  int transmitStatus = radio.transmit(message.c_str());
+  tx_time = millis() - tx_time;
   heltec_led(0);
-  tx_time = txResult.elapsed;
-  int transmitStatus = txResult.status;
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
@@ -777,26 +741,22 @@ void transmitWithDutyCycle(const String& message) {
     radio.startReceive();
 
     // After successful transmission, forward the message via WiFi if it's not a heartbeat.
+    // Only do this if the message originated via LoRa (i.e., if it was received from LoRa).
     if (!message.startsWith("HEARTBEAT|")) {
-      transmitViaWiFi(message);
+      if (status.origin == ORIGIN_LORA) {
+          transmitViaWiFi(message);
+      } else {
+          Serial.println("[LoRa Tx] Message originated via WiFi; skipping WiFi relay.");
+      }
     }
 
     // After successful transmission, remove the message from the queue.
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
-      // MODIFIED: If a new message is now at the head, start its timer.
-      if (!loraTransmissionQueue.empty()) {
-        loRaTransmitDelay = millis() + random(2000, 10000);
-        int sep = loraTransmissionQueue.front().indexOf('|');
-        if (sep != -1) {
-          String newMessageID = loraTransmissionQueue.front().substring(0, sep);
-          messageTransmissions[newMessageID].timestamp = millis();
-        }
-      }
     }
     // If more messages remain, schedule the next transmission.
     if (!loraTransmissionQueue.empty()) {
-      loRaTransmitDelay = millis() + random(2000, 10000);
+      loRaTransmitDelay = millis() + random(1201, 5000);
     }
   } else {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
@@ -829,9 +789,8 @@ void sendHeartbeat() {
   uint64_t txStart = millis();
   Serial.printf("[Heartbeat Tx] Sending: %s\n", heartbeatMessage.c_str());
   heltec_led(50);
-  TxResult txResult = transmitWithTimeout(heartbeatMessage, 10000);
-  uint64_t txTime = txResult.elapsed;
-  int transmitStatus = txResult.status;
+  int transmitStatus = radio.transmit(heartbeatMessage.c_str());
+  uint64_t txTime = millis() - txStart;
   heltec_led(0);
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
@@ -875,13 +834,12 @@ void sendAggregatedHeartbeat() {
     return;
   }
   
-  // Transmit the aggregated heartbeat message using the timeout wrapper.
+  // Transmit the aggregated heartbeat message
   uint64_t txStart = millis();
   Serial.printf("[Aggregated Heartbeat Tx] Sending: %s\n", aggMessage.c_str());
   heltec_led(50);
-  TxResult txResult = transmitWithTimeout(aggMessage, 10000);
-  uint64_t txTime = txResult.elapsed;
-  int transmitStatus = txResult.status;
+  int transmitStatus = radio.transmit(aggMessage.c_str());
+  uint64_t txTime = millis() - txStart;
   heltec_led(0);
   
   if (transmitStatus == RADIOLIB_ERR_NONE) {
@@ -1136,6 +1094,10 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
 
               String myId = getCustomNodeId(getNodeId());
 
+              // Set the origin of this message as LoRa.
+              auto &status = messageTransmissions[messageID];
+              status.origin = ORIGIN_LORA;
+
               // Ignore the message if it's our own original transmission.
               if (originatorID == myId && relayID == myId) {
                 Serial.println("[LoRa Rx] Own original message, ignore.");
@@ -1147,7 +1109,6 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
                   Serial.println("[LoRa Rx] Private message not for me, ignoring display.");
                 }
                 // --- Use the new "queuedForLoRa" flag to decide whether to schedule a relay ---
-                auto& status = messageTransmissions[messageID];
                 if (!status.queuedForLoRa && !status.relayedViaLoRa) {
                   scheduleLoRaTransmission(message);
                 }
@@ -1182,18 +1143,23 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
 
                   bool seenDirectly = false;
                   auto directIt = loraNodes.find(originatorID);
-                  if (directIt != loraNodes.end() && (millis() - directIt->second.lastSeen <= ACTIVE_THRESHOLD)) {
-                      seenDirectly = true;
+                  if (directIt != loraNodes.end()) {
+                      // The node is in the direct list; check if it was seen recently.
+                      if (millis() - directIt->second.lastSeen <= ACTIVE_THRESHOLD) {
+                          seenDirectly = true;
+                      }
                   }
 
                   if (seenDirectly) {
                       Serial.printf("[Indirect Nodes] Skipped indirect update for %s because it was seen directly within the last 15 minutes.\n", originatorID.c_str());
                   } else {
+                      // Proceed with adding/updating the indirect node record
                       uint64_t currentTime = millis();
                       NodeMetricsSample sample = { currentTime, rssi, snr };
                       String key = originatorID + "-" + relayID; // Composite key for separate relay entries
                       auto it = indirectNodes.find(key);
                       if (it != indirectNodes.end()) {
+                          // Update existing indirect node entry
                           it->second.lastSeen = currentTime;
                           it->second.rssi = rssi;
                           it->second.snr = snr;
@@ -1202,6 +1168,7 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
                               it->second.history.erase(it->second.history.begin());
                           }
                       } else {
+                          // Create a new indirect node entry
                           IndirectNode indNode;
                           indNode.originatorId = originatorID;
                           indNode.relayId = relayID;
@@ -1265,7 +1232,7 @@ void initMesh() {
 }
 
 void receivedCallback(uint32_t from, String& message) {
-  Serial.printf("[WiFi Rx] From %s: %s\n", getCustomNodeId(from).c_str(), message.c_str());
+Serial.printf("[WiFi Rx] From %s: %s\n", getCustomNodeId(from).c_str(), message.c_str());
 
   int lastSeparatorIndex = message.lastIndexOf('|');
   if (lastSeparatorIndex == -1) {
@@ -1285,11 +1252,11 @@ void receivedCallback(uint32_t from, String& message) {
     Serial.println("[WiFi Rx] CRC valid.");
   }
 
-  // Skip both plain and aggregated heartbeat messages in WiFi.
-  if (messageWithoutCRC.startsWith("HEARTBEAT|") || messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-    Serial.println("[WiFi Rx] Skipping heartbeat relay over WiFi.");
-    return;
-  }
+      // Skip both plain and aggregated heartbeat messages in WiFi.
+    if (messageWithoutCRC.startsWith("HEARTBEAT|") || messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+        Serial.println("[WiFi Rx] Skipping heartbeat relay over WiFi.");
+        return;
+    }
 
   // --- Only accept messages from our system ---
 // For non-heartbeat messages, verify that the first token (messageID) starts with "!M"
@@ -1333,8 +1300,11 @@ void receivedCallback(uint32_t from, String& message) {
     Serial.println("[WiFi Rx] Private message not for me, ignoring display.");
   }
 
+  // --- Set origin as WiFi for messages received via WiFi ---
+  auto &status = messageTransmissions[messageID];
+  status.origin = ORIGIN_WIFI;
+
   // --- Use the new "queuedForLoRa" flag to schedule a relay if not already done ---
-  auto& status = messageTransmissions[messageID];
   if (!status.queuedForLoRa && !status.relayedViaLoRa) {
     scheduleLoRaTransmission(message);
   }
@@ -1796,7 +1766,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
       fetch('/nodesData')
         .then(response => response.json())
         .then(data => {
-          // --- WiFi Nodes Section (unchanged) ---  
+          // --- WiFi Nodes Section (unchanged) ---
           const wifiUl = document.getElementById('wifiNodeList');
           wifiUl.innerHTML = '';
           const wifiCount = data.wifiNodes.length;
@@ -1904,6 +1874,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+
 // --- METRICS HISTORY PAGE (unchanged except for centering the toggle button) ---
 const char metricsPageHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -1920,10 +1891,6 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
       padding: 20px;
     }
     h2 {
-      text-align: center;
-      color: #333;
-    }
-    h3 {
       text-align: center;
       color: #333;
     }
@@ -2216,6 +2183,7 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
   uint64_t ageSec = ageMs / 1000;
@@ -2375,7 +2343,10 @@ server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
     addMessage(getCustomNodeId(getNodeId()), messageID, senderName, target, newMessage, "[LoRa]", relayID);
     Serial.printf("[LoRa Tx] Adding message: %s\n", constructedMessage.c_str());
 
-    // --- NEW: Immediately transmit the originated message on WiFi ---
+    // --- Set the origin for locally originated messages as WiFi ---
+    messageTransmissions[messageID].origin = ORIGIN_WIFI;
+
+    // --- Immediately transmit the originated message on WiFi ---
     transmitViaWiFi(constructedMessage);
     // --- Schedule LoRa transmission immediately (for originated messages, our schedule uses no delay) ---
     scheduleLoRaTransmission(constructedMessage);
@@ -2604,25 +2575,25 @@ int getNodeCount() {
   uint64_t now = millis();
 
   // 1. Add WiFi (mesh) nodes.
+  // mesh.getNodeList() returns a vector of node IDs (uint32_t).
+  // Convert each to your custom string format (e.g., "!Mxxxxxx").
   auto wifiNodes = mesh.getNodeList();
   for (uint32_t id : wifiNodes) {
     uniqueNodes.insert(getCustomNodeId(id));
   }
 
   // 2. Add direct LoRa nodes (only if seen in the last 16 minutes).
-  const uint64_t DIRECT_THRESHOLD = 16UL * 60UL * 1000UL;
+  const uint64_t DIRECT_THRESHOLD = 16UL * 60UL * 1000UL;  // 16 minutes in ms
   for (auto const &entry : loraNodes) {
     if (now - entry.second.lastSeen <= DIRECT_THRESHOLD) {
-      uniqueNodes.insert(entry.first);
+      uniqueNodes.insert(entry.first);  // entry.first is the node ID (string)
     }
   }
 
   // 3. Add indirect nodes (using the originatorId) if seen in the last 31 minutes.
-  const uint64_t INDIRECT_THRESHOLD = 1860000;
+  const uint64_t INDIRECT_THRESHOLD = 1860000;  // 31 minutes in ms
   for (auto const &entry : indirectNodes) {
-    if (now - entry.second.lastSeen <= INDIRECT_THRESHOLD) {
-      uniqueNodes.insert(entry.second.originatorId);
-    }
+    uniqueNodes.insert(entry.second.originatorId);
   }
 
   return uniqueNodes.size();
