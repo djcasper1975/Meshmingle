@@ -1,12 +1,13 @@
-//Test v1.00.019
-//12-02-2025
+//Test v1.00.020
+//13-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //random seed was terrible much better now
-//relaying updates. 
+//relaying updates works brilliant.
+//removed rx check it wasnt much good.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -427,42 +428,43 @@ void scheduleLoRaTransmission(String message) {
     String messageContent = messageWithoutCRC.substring(fourthSeparator + 1, fifthSeparator);
     String relayID = messageWithoutCRC.substring(fifthSeparator + 1);
 
-    // Do not relay private messages that have reached their recipient.
     String myId = getCustomNodeId(getNodeId());
+    // Do not relay private messages that have reached their recipient.
     if (recipientID != "ALL" && myId == recipientID) {
         Serial.println("[LoRa Schedule] Private message reached its recipient. Not scheduling retransmission.");
         return;
     }
 
-    // Check if this message is already queued for LoRa transmission.
     auto& status = messageTransmissions[messageID];
     if (status.queuedForLoRa) {
       Serial.println("[LoRa Schedule] Message already queued for LoRa, skipping...");
       return;
     }
 
-// Check if this message already has our node as the relay
-if (relayID != myId) {
-    // This node is relaying a message from someone else (or even our own message if relayed by another node)
-    String newRelayID = myId;
-    String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
-    loraTransmissionQueue.push_back(updatedMessage);
-    status.queuedForLoRa = true;
-    if (loraTransmissionQueue.size() == 1) {
-      loRaTransmitDelay = millis() + global_jitter_offset;
+    // [MODIFIED]:
+    // If the message is from a remote node (relayID != myId),
+    // add an extra random delay (between 3000 and 13,000 ms) on top of the global_jitter_offset.
+    if (relayID != myId) {
+        String newRelayID = myId;
+        String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
+        loraTransmissionQueue.push_back(updatedMessage);
+        status.queuedForLoRa = true;
+        if (loraTransmissionQueue.size() == 1) {
+            unsigned long extraDelay = random(3000, 13000); // extra random delay between 3000ms and 13,000ms
+            loRaTransmitDelay = millis() + global_jitter_offset + extraDelay;
+        }
+        Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
+                      newRelayID.c_str(), loRaTransmitDelay - millis(), updatedMessage.c_str());
+    } else {
+        // For an original message from this node, use the global jitter offset only.
+        loraTransmissionQueue.push_back(message);
+        status.queuedForLoRa = true;
+        if (loraTransmissionQueue.size() == 1) {
+            loRaTransmitDelay = millis() + global_jitter_offset;
+        }
+        Serial.printf("[LoRa Schedule] Scheduled original message with delay %lu ms: %s\n",
+                      loRaTransmitDelay - millis(), message.c_str());
     }
-    Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
-                  newRelayID.c_str(), loRaTransmitDelay - millis(), updatedMessage.c_str());
-} else {
-    // The message already has our relay ID, so this is an original transmission.
-    loraTransmissionQueue.push_back(message);
-    status.queuedForLoRa = true;
-    if (loraTransmissionQueue.size() == 1) {
-      loRaTransmitDelay = millis();
-    }
-    Serial.printf("[LoRa Schedule] Scheduled original message immediately: %s\n",
-                  message.c_str());
-}
 }
 
 void transmitViaWiFi(const String& message) {
@@ -676,26 +678,7 @@ void transmitWithDutyCycle(const String& message) {
     return;
   }
 
-  // Check if the radio is busy with a timeout of 5 seconds.
-  static uint64_t rxCheckStart = 0;
-  if (radio.available()) {
-    if (rxCheckStart == 0) {
-      rxCheckStart = millis();  // Start timer when RX is first detected.
-    }
-    if (millis() - rxCheckStart >= 5000) {  // 5-second timeout reached.
-      Serial.println("[LoRa Tx] RX appears stuck for 5 seconds. Forcing transmission...");
-      // Since SX1262 doesn't have stopReceive(), we simply restart RX mode.
-      radio.startReceive();  
-      rxCheckStart = 0;  // Reset timer.
-    } else {
-      Serial.println("[LoRa Tx] Radio busy. Delaying transmission by 500ms.");
-      loRaTransmitDelay = millis() + 500;
-      return;
-    }
-  } else {
-    // Reset the timer if the radio is not busy.
-    rxCheckStart = 0;
-  }
+  // Removed the radio.available() check to avoid waiting for RX clearance.
 
   // Extract the messageID from the message (assumes message format is valid).
   int separatorIndex = message.indexOf('|');
@@ -704,18 +687,9 @@ void transmitWithDutyCycle(const String& message) {
     return;
   }
   String messageID = message.substring(0, separatorIndex);
-  auto& status = messageTransmissions[messageID];
-  if (status.transmittedViaLoRa) {
-    Serial.println("[LoRa Tx] Message already sent via LoRa, skipping...");
-    if (!loraTransmissionQueue.empty()) {
-      loraTransmissionQueue.erase(loraTransmissionQueue.begin());
-      if (!loraTransmissionQueue.empty()) {
-        loRaTransmitDelay = millis() + global_jitter_offset;
-      }
-    }
-    return;
-  }
-
+  
+  // (We no longer check if already transmitted; every node with the queued copy will transmit.)
+  
   // Record the transmission start time and transmit the message.
   tx_time = millis();
   Serial.printf("[LoRa Tx] Transmitting: %s\n", message.c_str());
@@ -726,30 +700,30 @@ void transmitWithDutyCycle(const String& message) {
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
-    status.transmittedViaLoRa = true;
-    status.relayedViaLoRa = true;
-    // Clear the queued flag now that it has been transmitted.
-    status.queuedForLoRa = false;
+    // Mark this node's own transmission as successful.
+    messageTransmissions[messageID].transmittedViaLoRa = true;
+    messageTransmissions[messageID].relayedViaLoRa = true;
+    // Clear the queued flag so that future scheduling is possible.
+    messageTransmissions[messageID].queuedForLoRa = false;
     calculateDutyCyclePause(tx_time);
     last_tx = millis();
     drawMainScreen(tx_time);
     radio.startReceive();
 
     // After successful transmission, forward the message via WiFi if it's not a heartbeat.
-    // Only do this if the message originated via LoRa (i.e., if it was received from LoRa).
     if (!message.startsWith("HEARTBEAT|")) {
-      if (status.origin == ORIGIN_LORA) {
+      if (messageTransmissions[messageID].origin == ORIGIN_LORA) {
           transmitViaWiFi(message);
       } else {
           Serial.println("[LoRa Tx] Message originated via WiFi; skipping WiFi relay.");
       }
     }
 
-    // After successful transmission, remove the message from the queue.
+    // Remove the queued copy once transmitted.
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
     }
-    // If more messages remain, schedule the next transmission.
+    // Schedule next transmission if any remain.
     if (!loraTransmissionQueue.empty()) {
       loRaTransmitDelay = millis() + global_jitter_offset;
     }
@@ -2511,3 +2485,4 @@ int getNodeCount() {
 void initServer() {
   setupServerRoutes();
 }
+
