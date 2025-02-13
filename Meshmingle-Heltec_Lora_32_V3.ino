@@ -65,7 +65,7 @@ std::map<String, TransmissionStatus> messageTransmissions;
 #define FREQUENCY 869.4000 
 #define BANDWIDTH 250.0 
 #define SPREADING_FACTOR 11 
-#define TRANSMIT_POWER 21 
+#define TRANSMIT_POWER 22 
 #define CODING_RATE 8  
 String rxdata;
 // Global RX flag
