@@ -1,4 +1,4 @@
-//Test v1.00.020
+//Test v1.00.021
 //13-02-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
@@ -8,6 +8,7 @@
 //random seed was terrible much better now
 //relaying updates works brilliant.
 //removed rx check it wasnt much good.
+//wifi mesh count was counting lora and indirect lora. it was just wifi mesh. now back to wifi mesh again.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -151,7 +152,7 @@ struct Message {
 
 std::vector<Message> messages;  
 
-int totalNodeCount = 0;
+int totalNodeCount = 0;  // <-- now holds the WiFi (mesh) count only
 uint32_t currentNodeId = 0;
 
 unsigned long loRaTransmitDelay = 0; 
@@ -579,21 +580,23 @@ void drawMainScreen(long txTimeMillis = -1) {
   display.drawString((128 - titleWidth) / 2, 0, "Meshmingle 1.0");
   display.drawString(0, 13, "Node ID: " + getCustomNodeId(getNodeId()));
 
-  // Count active LoRa nodes
+  // Count active direct LoRa nodes only (15min timeout)
   uint64_t currentTime = millis();
-  const uint64_t timeout = 900000; // 15 minutes
-  int activeLoRaNodes = 0;
-
+  int activeDirectLoRaNodes = 0;
+  const uint64_t DIRECT_TIMEOUT = 900000; // 15 minutes
   for (const auto& node : loraNodes) {
-    if (currentTime - node.second.lastSeen <= timeout) {
-      activeLoRaNodes++;
+    if (currentTime - node.second.lastSeen <= DIRECT_TIMEOUT) {
+      activeDirectLoRaNodes++;
     }
   }
+  int totalActiveLoRaNodes = activeDirectLoRaNodes;  // Only direct LoRa nodes are counted
+  
+  int wifiCount = totalNodeCount;  // totalNodeCount is updated in updateMeshData()
 
-  String combinedNodes = "WiFi Nodes: " + String(getNodeCount()) + "  LoRa: " + String(activeLoRaNodes);
+  String combinedNodes = "WiFi Nodes: " + String(wifiCount) + "  LoRa: " + String(totalActiveLoRaNodes);
   int16_t combinedWidth = display.getStringWidth(combinedNodes);
   if (combinedWidth > 128) {
-    combinedNodes = "WiFi: " + String(getNodeCount()) + " LoRa: " + String(activeLoRaNodes);
+    combinedNodes = "WiFi: " + String(wifiCount) + " LoRa: " + String(totalActiveLoRaNodes);
   }
   display.drawString(0, 27, combinedNodes);
 
@@ -611,6 +614,7 @@ void drawMainScreen(long txTimeMillis = -1) {
 
   display.display();
 }
+
 
 void displayCarousel() {
   unsigned long currentMillis = millis();
@@ -2156,9 +2160,10 @@ void setupServerRoutes() {
     request->send(200, "application/json", json);
   });
 
+  // --- UPDATED: Use totalNodeCount (mesh nodes only) for deviceCount ---
   server.on("/deviceCount", HTTP_GET, [](AsyncWebServerRequest* request) {
     updateMeshData();
-    request->send(200, "application/json", "{\"totalCount\":" + String(getNodeCount()) + ", \"nodeId\":\"" + getCustomNodeId(getNodeId()) + "\"}");
+    request->send(200, "application/json", "{\"totalCount\":" + String(totalNodeCount) + ", \"nodeId\":\"" + getCustomNodeId(getNodeId()) + "\"}");
   });
 
   server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -2485,4 +2490,3 @@ int getNodeCount() {
 void initServer() {
   setupServerRoutes();
 }
-
