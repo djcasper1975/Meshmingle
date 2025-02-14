@@ -1,5 +1,8 @@
-//Test v1.00.021
-//13-02-2025
+//Test v1.00.022
+//14-02-2025
+//
+//YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!!!!!
+//
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
@@ -9,6 +12,9 @@
 //relaying updates works brilliant.
 //removed rx check it wasnt much good.
 //wifi mesh count was counting lora and indirect lora. it was just wifi mesh. now back to wifi mesh again.
+//added emojis to sent messages. showing greeen or red circle and a satalite for each relay heard.
+//circle and satalite diff sizes so circle is smaller.
+//overall performance is way better. next up to add is tx logs.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -137,14 +143,16 @@ DNSServer dnsServer;
 painlessMesh mesh;
 
 // --- Updated Message structure with a new recipient field ---
+// NEW: Added relayIDs vector to hold all relay IDs for our own message.
 struct Message {
   String nodeId;     // originator node ID
   String sender;
-  String recipient;  // NEW: target node (or "ALL" for public messages)
+  String recipient;  // target node (or "ALL" for public messages)
   String content;
   String source;     // e.g., "[WiFi]" or "[LoRa]"
   String messageID;  
   String relayID;    
+  std::vector<String> relayIDs; // NEW: List of relay IDs for our own message
   int rssi;          
   float snr;         
   uint64_t timeReceived;
@@ -217,7 +225,7 @@ struct LoRaNode {
   float lastSNR;
   uint64_t lastSeen;
   std::vector<NodeMetricsSample> history; 
-  String statusEmoji; // <-- NEW: Holds the emoji for this node
+  String statusEmoji; // NEW: Holds the emoji for this node
 };
 
 // Global container for direct LoRa nodes
@@ -231,7 +239,7 @@ struct IndirectNode {
   int rssi;              // RSSI as measured from the relay’s transmission
   float snr;             // SNR as measured from the relay’s transmission
   uint64_t lastSeen;     // Timestamp when we last received a relayed message from this originator via the relay
-  String statusEmoji;    // <-- NEW: Holds the emoji for this indirect node
+  String statusEmoji;    // NEW: Holds the emoji for this indirect node
   std::vector<NodeMetricsSample> history;  // NEW: History samples (up to 24 hours)
 };
 
@@ -312,7 +320,8 @@ void cleanupTransmissionHistory() {
   }
 }
 
-// --- Updated addMessage() to accept the recipient and only add private messages if intended ---
+// --- UPDATED addMessage() to accept the recipient and only add private messages if intended ---
+// Also, for messages originating from our node, update the relay info and store each unique relayID.
 void addMessage(const String& nodeId, const String& messageID, const String& sender, 
                 const String& recipient, String content, const String& source, 
                 const String& relayID, int rssi = 0, float snr = 0.0) {
@@ -329,13 +338,31 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
     // Look for the existing message in the messages vector.
     for (auto &msg : messages) {
       if (msg.messageID == messageID) {
-        // Check if this message originates from our node.
         String myId = getCustomNodeId(getNodeId());
+        // For messages originating from our node, update the relay info if we receive a LoRa update
+        // that shows a relayID different from our own.
         if (msg.nodeId == myId) {
-          // Do not update the UI sent message with relay info.
+          if (source == "[LoRa]" && relayID != myId) {
+            if (msg.relayIDs.size() == 0) {
+              Serial.printf("Updating our message %s with relay info from %s\n", messageID.c_str(), relayID.c_str());
+              msg.source = "[LoRa]";
+              msg.rssi = rssi;
+              msg.snr = snr;
+              msg.relayID = relayID;
+              msg.relayIDs.push_back(relayID);
+            } else {
+              bool exists = false;
+              for (auto &id : msg.relayIDs) {
+                if (id == relayID) { exists = true; break; }
+              }
+              if (!exists) {
+                msg.relayIDs.push_back(relayID);
+              }
+            }
+          }
           break;
         }
-        // Otherwise, if the new message is from LoRa but the stored one is not, update it.
+        // For messages not from our node, if the new message is from LoRa but the stored one is not, update it.
         if (source == "[LoRa]" && msg.source != "[LoRa]") {
           Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
           msg.source = "[LoRa]";
@@ -369,6 +396,7 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
     finalSource,
     messageID,
     relayID,
+    std::vector<String>(), // Initialize relayIDs as empty
     rssi,
     snr,
     millis()
@@ -387,7 +415,6 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
                 nodeId.c_str(), sender.c_str(), recipient.c_str(), content.c_str(),
                 finalSource.c_str(), messageID.c_str(), relayID.c_str());
 }
-
 
 //
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
@@ -1351,6 +1378,7 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
       box-sizing: border-box;
       border: 2px solid;
       word-wrap: break-word;
+      position: relative;
     }
     .message.sent {
       align-self: flex-end;
@@ -1392,6 +1420,22 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
       color: #999;
       text-align: right;
       margin-top: 5px;
+    }
+    /* Relay-status indicator for sent messages */
+    .message.sent .relay-status {
+      position: absolute;
+      bottom: 2px;
+      left: 2px;
+      line-height: 1;
+    }
+    /* Change only the circle's size to 0.75em */
+    .message.sent .relay-status .circle {
+      font-size: 0.75em;
+    }
+    /* Satellite and keyboard icons remain at full (1em) size */
+    .message.sent .relay-status .satellite,
+    .message.sent .relay-status .keyboard {
+      font-size: 1em;
     }
     #deviceCount {
       margin: 5px 0;
@@ -1545,6 +1589,19 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
             <span class="message-time">${timestamp}</span>
             ${rssiSnrHtml}
           `;
+          // For messages sent by us, add a relay-status indicator in the bottom left.
+          if (isSentByCurrentNode) {
+            let indicator = "";
+            if (msg.relayIDs && msg.relayIDs.length > 0) {
+              indicator += '<span class="circle">🟢</span>';
+              for (let i = 0; i < msg.relayIDs.length; i++) {
+                indicator += '<span class="satellite">🛰️</span>';
+              }
+            } else {
+              indicator = '<span class="circle">🔴</span><span class="keyboard">⌨️</span>';
+            }
+            li.innerHTML += `<span class="relay-status">${indicator}</span>`;
+          }
           ul.appendChild(li);
         });
 
@@ -1802,8 +1859,6 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-
-// --- METRICS HISTORY PAGE ---
 const char metricsPageHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -2135,6 +2190,10 @@ std::vector<Message> getNodeMessages(const String& nodeId) {
   return result;
 }
 
+void setupServer() {
+  setupServerRoutes();
+}
+
 void setupServerRoutes() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "text/html", mainPageHtml);
@@ -2153,6 +2212,15 @@ void setupServerRoutes() {
       if (msg.source == "[LoRa]") {
         json += ",\"rssi\":" + String(msg.rssi) + ",\"snr\":" + String(msg.snr, 2);
       }
+      // NEW: output the relayIDs vector as an array
+      json += ",\"relayIDs\":[";
+      bool firstRelay = true;
+      for (auto &rid : msg.relayIDs) {
+        if (!firstRelay) json += ",";
+        json += "\"" + rid + "\"";
+        firstRelay = false;
+      }
+      json += "]";
       json += "}";
       first = false;
     }
