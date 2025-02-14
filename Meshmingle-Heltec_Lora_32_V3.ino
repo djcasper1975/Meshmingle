@@ -1,4 +1,4 @@
-//Test v1.00.022
+//Test v1.00.023
 //14-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!!!!!
@@ -15,6 +15,7 @@
 //added emojis to sent messages. showing greeen or red circle and a satalite for each relay heard.
 //circle and satalite diff sizes so circle is smaller.
 //overall performance is way better. next up to add is tx logs.
+//added agg heartbeat global variable to dissable it for now as its faulty.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -132,6 +133,9 @@ void calculateDutyCyclePause(uint64_t tx_time) {
 #define MESH_PASSWORD ""  
 #define MESH_PORT 5555
 const int maxMessages = 50;
+
+//0 hop nodelist sharing.
+bool sendAggregatedHeartbeats = false; // theres issues with this right now!!!!
 
 // Duty Cycle Variables
 bool bypassDutyCycle = false;     
@@ -812,13 +816,27 @@ void sendHeartbeat() {
 }
 
 void sendAggregatedHeartbeat() {
+  if (!sendAggregatedHeartbeats) {
+    Serial.println("[Aggregated Heartbeat Tx] Aggregated heartbeats are disabled by global flag.");
+    return;
+  }
+  
   String aggMsgWithoutCRC = "AGG_HEARTBEAT|" + getCustomNodeId(getNodeId());
   
-  // Append each direct LoRa node's ID (except our own)
-  for (auto const &pair : loraNodes) {
-    const LoRaNode &loraNode = pair.second;
-    if (loraNode.nodeId != getCustomNodeId(getNodeId())) {
-      aggMsgWithoutCRC += "|" + loraNode.nodeId;
+  // Old behavior: iterating through all LoRa nodes:
+  // for (auto const &pair : loraNodes) {
+  //   const LoRaNode &loraNode = pair.second;
+  //   if (loraNode.nodeId != getCustomNodeId(getNodeId())) {
+  //     aggMsgWithoutCRC += "|" + loraNode.nodeId;
+  //   }
+  // }
+  
+  // New behavior: advertise only your direct mesh nodes (0-hop)
+  auto directNodes = mesh.getNodeList();
+  for (uint32_t node : directNodes) {
+    String nodeIdStr = getCustomNodeId(node);
+    if (nodeIdStr != getCustomNodeId(getNodeId())) {
+      aggMsgWithoutCRC += "|" + nodeIdStr;
     }
   }
   
@@ -997,70 +1015,58 @@ void loop() {
               Serial.println("[LoRa Rx] Own heartbeat, ignore.");
             }
           }
-          else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-            Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
-            int firstSep = messageWithoutCRC.indexOf('|');
-            if (firstSep == -1) {
-              Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
-            } else {
-              int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);
-              String senderRelayId;
-              if (secondSep == -1) {
-                senderRelayId = messageWithoutCRC.substring(firstSep + 1);
-              } else {
-                senderRelayId = messageWithoutCRC.substring(firstSep + 1, secondSep);
-              }
-              
-              int startPos = secondSep + 1;
-              while (true) {
-                int nextSep = messageWithoutCRC.indexOf('|', startPos);
-                String originatorId;
-                if (nextSep == -1) {
-                  originatorId = messageWithoutCRC.substring(startPos);
-                } else {
-                  originatorId = messageWithoutCRC.substring(startPos, nextSep);
-                }
-                
-                if (originatorId.length() > 0 && originatorId != getCustomNodeId(getNodeId())) {
-                  auto directIt = loraNodes.find(originatorId);
-                  if (directIt != loraNodes.end() && (millis() - directIt->second.lastSeen) <= DIRECT_NODE_TIMEOUT) {
-                    Serial.printf("[Indirect Nodes] Skipped aggregated indirect update for %s (seen directly)\n", originatorId.c_str());
-                  } else {
-                    uint64_t currentTime = millis();
-                    int rssi = radio.getRSSI();
-                    float snr = radio.getSNR();
-                    NodeMetricsSample sample = { currentTime, rssi, snr };
-                    String key = originatorId + "-" + senderRelayId;
-                    auto it = indirectNodes.find(key);
-                    if (it != indirectNodes.end()) {
-                      it->second.lastSeen = currentTime;
-                      it->second.rssi = rssi;
-                      it->second.snr = snr;
-                      it->second.history.push_back(sample);
-                      if (it->second.history.size() > 60) {
-                        it->second.history.erase(it->second.history.begin());
-                      }
-                    } else {
-                      IndirectNode indNode;
-                      indNode.originatorId = originatorId;
-                      indNode.relayId = senderRelayId;
-                      indNode.rssi = rssi;
-                      indNode.snr = snr;
-                      indNode.lastSeen = currentTime;
-                      indNode.statusEmoji = "🛰️";
-                      indNode.history.push_back(sample);
-                      indirectNodes[key] = indNode;
-                    }
-                    Serial.printf("[Indirect Nodes] Updated via Aggregated Heartbeat: Originator: %s, Relay: %s, RSSI: %d, SNR: %.2f\n",
-                                  originatorId.c_str(), senderRelayId.c_str(), rssi, snr);
-                  }
-                }
-                
-                if (nextSep == -1) break;
-                startPos = nextSep + 1;
-              }
-            }
-          }
+else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+  Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
+  // Extract the sender of the aggregated heartbeat (the node that transmitted it)
+  int firstSep = messageWithoutCRC.indexOf('|');
+  if (firstSep == -1) {
+    Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
+  } else {
+    String senderRelayId = messageWithoutCRC.substring(firstSep + 1, messageWithoutCRC.indexOf('|', firstSep + 1));
+    // Now process the remaining fields as direct neighbors of senderRelayId
+    int startPos = messageWithoutCRC.indexOf('|', firstSep + 1) + 1;
+    while (true) {
+      int nextSep = messageWithoutCRC.indexOf('|', startPos);
+      String neighborId;
+      if (nextSep == -1) {
+        neighborId = messageWithoutCRC.substring(startPos);
+      } else {
+        neighborId = messageWithoutCRC.substring(startPos, nextSep);
+      }
+      
+      if (neighborId.length() > 0 && neighborId != getCustomNodeId(getNodeId())) {
+        // Here, update your 1-hop (indirect) node list
+        uint64_t currentTime = millis();
+        int rssi = radio.getRSSI();
+        float snr = radio.getSNR();
+        
+        // Use a composite key to store these nodes
+        String key = neighborId + "-" + senderRelayId;
+        auto it = indirectNodes.find(key);
+        if (it != indirectNodes.end()) {
+          it->second.lastSeen = currentTime;
+          it->second.rssi = rssi;
+          it->second.snr = snr;
+          // Optionally update history if needed
+        } else {
+          IndirectNode indNode;
+          indNode.originatorId = neighborId;
+          indNode.relayId = senderRelayId;
+          indNode.rssi = rssi;
+          indNode.snr = snr;
+          indNode.lastSeen = currentTime;
+          indNode.statusEmoji = "🛰️";  // Mark as 1-hop from senderRelayId
+          indirectNodes[key] = indNode;
+        }
+        Serial.printf("[Indirect Nodes] Updated 1-hop indirect node: Originator: %s, via Relay: %s, RSSI: %d, SNR: %.2f\n",
+                      neighborId.c_str(), senderRelayId.c_str(), rssi, snr);
+      }
+      
+      if (nextSep == -1) break;
+      startPos = nextSep + 1;
+    }
+  }
+}
           else {
             int firstSeparator = messageWithoutCRC.indexOf('|');
             int secondSeparator = messageWithoutCRC.indexOf('|', firstSeparator + 1);
