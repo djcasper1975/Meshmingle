@@ -9,6 +9,7 @@
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //fixed html page issues
+//Added Rx Boost
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -32,8 +33,23 @@
 #include <RadioLib.h>
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
 
-// Instantiate the SX1262 radio object with the defined pins
-//SX1262 radio(RADIO_NSS, RADIO_DIO1, RADIO_BUSY, RADIO_RESET);
+// Meshmingle Parameters
+#define MESH_SSID "meshmingle.co.uk"
+#define MESH_PASSWORD ""  //WARNING!! If you have set this and then unset it and reflash you must do FULL ERASE FIRST.
+#define MESH_PORT 5555
+
+// LoRa Parameters
+#define PAUSE 5400000  //Required timeout Time for dutycycle (54 Min)
+#define FREQUENCY 869.4000 //We are currently using an EU868 Lora Frequency that requires the full band 869.4000 - 869.6500 only single channel use supported for now.
+#define BANDWIDTH 250.0 
+#define SPREADING_FACTOR 11 
+#define TRANSMIT_POWER 22 //This is max power for This Boards EU868 Config.
+#define CODING_RATE 8 
+
+// Some Global Variables
+bool enableRxBoost = true; //enable or disable RX Boost Mode
+bool sendAggregatedHeartbeats = false;  //0 hop nodelist sharing. Theres issues with this right now!!!!
+bool bypassDutyCycle = false;  // Enable or Dissable DutyCycle (For Non EU Use ONLY!!!)
 
 // ---------------------------------------------------------------------
 // NEW: Define an enum to track the origin of each message
@@ -72,18 +88,7 @@ struct RelayLogEntry {
 
 // Global relay log: maps messageID to a vector of relay log entries.
 std::map<String, std::vector<RelayLogEntry>> relayLog;
-
-// -----------------------
-// (Other functions, e.g. cleanupMessageTransmissions(), LoRa setup, mesh setup, etc., remain unchanged.)
-// -----------------------
-
-// LoRa Parameters
-#define PAUSE 5400000  
-#define FREQUENCY 869.4000 
-#define BANDWIDTH 250.0 
-#define SPREADING_FACTOR 11 
-#define TRANSMIT_POWER 22 
-#define CODING_RATE 8  
+ 
 String rxdata;
 // Global RX flag
 volatile bool rxFlag = false;
@@ -138,17 +143,9 @@ void calculateDutyCyclePause(uint64_t tx_time) {
     }
 }
 
-// Meshmingle Parameters
-#define MESH_SSID "meshmingle.co.uk"
-#define MESH_PASSWORD ""  
-#define MESH_PORT 5555
 const int maxMessages = 50;
 
-//0 hop nodelist sharing.
-bool sendAggregatedHeartbeats = false; // theres issues with this right now!!!!
-
-// Duty Cycle Variables
-bool bypassDutyCycle = false;     
+// Duty Cycle Variables    
 bool dutyCycleActive = false;     
 bool lastDutyCycleActive = false; 
 
@@ -919,7 +916,11 @@ void setup() {
 
   RADIOLIB_OR_HALT(radio.begin());
   radio.setDio1Action(onRadioRx);
+if(enableRxBoost) {
   RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));  // Enable boosted RX mode
+} else {
+  RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(false)); // Disable boosted RX mode
+}
   RADIOLIB_OR_HALT(radio.setFrequency(FREQUENCY));
   RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
   RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
