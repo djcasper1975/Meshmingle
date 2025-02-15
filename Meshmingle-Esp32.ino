@@ -67,7 +67,6 @@ const int maxMessages = 50;
 // -----------------------------
 // Utility functions
 // -----------------------------
-
 // Returns a custom formatted node id, e.g., "!Mxxxxxx"
 String getCustomNodeId(uint32_t nodeId) {
   String hexNodeId = String(nodeId, HEX);
@@ -243,32 +242,41 @@ void initMesh() {
 // -----------------------------
 // Additional Functions for Node Count & Unknown Nodes
 // -----------------------------
-
-// Returns the union of WiFi nodes and any nodes seen in messages.
+// Returns the union of WiFi nodes and any nodes seen in messages, excluding our own node.
 int getTotalNodeCount() {
   std::set<String> uniqueNodes;
+  String myId = getCustomNodeId(currentNodeId);
   // Add WiFi nodes:
   auto wifiNodes = mesh.getNodeList();
   for (uint32_t id : wifiNodes) {
-    uniqueNodes.insert(getCustomNodeId(id));
+    String nodeStr = getCustomNodeId(id);
+    if (nodeStr != myId) {
+      uniqueNodes.insert(nodeStr);
+    }
   }
   // Also add nodes from message history:
   for (auto const &msg : messageList) {
-    uniqueNodes.insert(msg.nodeId);
+    if (msg.nodeId != myId) {
+      uniqueNodes.insert(msg.nodeId);
+    }
   }
   return uniqueNodes.size();
 }
 
 // Returns a vector of "unknown" node IDs – those that appear in messages but are not in the WiFi list.
+// Excludes our own node.
 std::vector<String> getUnknownNodes() {
   std::set<String> wifiSet;
   auto wifiNodes = mesh.getNodeList();
+  String myId = getCustomNodeId(currentNodeId);
   for (uint32_t id : wifiNodes) {
     wifiSet.insert(getCustomNodeId(id));
   }
   std::set<String> unknownSet;
   for (auto const &msg : messageList) {
-    unknownSet.insert(msg.nodeId);
+    if (msg.nodeId != myId) {
+      unknownSet.insert(msg.nodeId);
+    }
   }
   // Remove any that are in the WiFi set:
   for (auto const &w : wifiSet) {
@@ -285,7 +293,6 @@ std::vector<String> getUnknownNodes() {
 // -----------------------------
 // Web Server Pages & Routes
 // -----------------------------
-
 const char mainPageHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -756,7 +763,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
             wifiUl.appendChild(li);
           });
 
-          // Display Lora nodes (renamed from "indirect" nodes):
+          // Display Lora nodes (renamed from "unknown" nodes):
           const loraUl = document.getElementById('loraNodeList');
           loraUl.innerHTML = '';
           const loraCount = data.unknownNodes.length;
