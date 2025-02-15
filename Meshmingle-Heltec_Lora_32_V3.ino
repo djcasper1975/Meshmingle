@@ -8,15 +8,8 @@
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//random seed was terrible much better now
-//relaying updates works brilliant.
-//removed rx check it wasnt much good.
-//wifi mesh count was counting lora and indirect lora. it was just wifi mesh. now back to wifi mesh again.
-//added emojis to sent messages. showing greeen or red circle and a satalite for each relay heard.
-//circle and satalite diff sizes so circle is smaller.
-//overall performance is way better. next up to add is tx logs.
-//added agg heartbeat global variable to dissable it for now as its faulty.
-//better delays now preset for relaying. based on chip id. and incriments.
+//fixed html page issues
+
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -38,6 +31,9 @@
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
+
+// Instantiate the SX1262 radio object with the defined pins
+//SX1262 radio(RADIO_NSS, RADIO_DIO1, RADIO_BUSY, RADIO_RESET);
 
 // ---------------------------------------------------------------------
 // NEW: Define an enum to track the origin of each message
@@ -923,7 +919,7 @@ void setup() {
 
   RADIOLIB_OR_HALT(radio.begin());
   radio.setDio1Action(onRadioRx);
-
+  RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));  // Enable boosted RX mode
   RADIOLIB_OR_HALT(radio.setFrequency(FREQUENCY));
   RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
   RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
@@ -1937,6 +1933,9 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
       text-align: center;
       color: #333;
     }
+    h3 {
+  text-align: center;
+}
     .node-id {
       text-align: center;
       font-size: 1.2em;
@@ -2457,9 +2456,9 @@ void setupServerRoutes() {
     request->send(200, "application/json", json);
   });
 
-  server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request){
-    if(!request->hasParam("nodeId")) {
-      String html = 
+server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request) {
+  if (!request->hasParam("nodeId")) {
+    String html =
       "<!DOCTYPE html><html lang='en'><head>"
       "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
       "<title>LoRa Nodes List</title>"
@@ -2482,28 +2481,28 @@ void setupServerRoutes() {
       "<h2>LoRa Node Details</h2>"
       "<p style='text-align:center;'>Select a LoRa node to see metrics and messages.</p>"
       "<div class='node-list'>";
-      uint64_t currentTime = millis();
-      const uint64_t FIFTEEN_MINUTES = 900000;
-      bool anyLoRa = false;
-      for(auto &kv : loraNodes) {
-        if(currentTime - kv.second.lastSeen <= FIFTEEN_MINUTES) {
-          anyLoRa = true;
-          html += "<a class='node-link' href='/loraDetails?nodeId=" + kv.first + "'>"
-                  + kv.first + "</a>";
-        }
+    uint64_t currentTime = millis();
+    const uint64_t FIFTEEN_MINUTES = 900000;
+    bool anyLoRa = false;
+    for (auto &kv : loraNodes) {
+      if (currentTime - kv.second.lastSeen <= FIFTEEN_MINUTES) {
+        anyLoRa = true;
+        html += "<a class='node-link' href='/loraDetails?nodeId=" + kv.first + "'>"
+                + kv.first + "</a>";
       }
-      if(!anyLoRa) {
-        html += "<p>No LoRa nodes seen in last 15 minutes.</p>";
-      }
-      html += "</div></body></html>";
-      request->send(200, "text/html", html);
-    } else {
-      String nodeId = request->getParam("nodeId")->value();
-      LoRaNode *found = nullptr;
-      if(loraNodes.find(nodeId) != loraNodes.end()){
-        found = &loraNodes[nodeId];
-      }
-      String html =
+    }
+    if (!anyLoRa) {
+      html += "<p>No LoRa nodes seen in last 15 minutes.</p>";
+    }
+    html += "</div></body></html>";
+    request->send(200, "text/html", html);
+  } else {
+    String nodeId = request->getParam("nodeId")->value();
+    LoRaNode *found = nullptr;
+    if (loraNodes.find(nodeId) != loraNodes.end()) {
+      found = &loraNodes[nodeId];
+    }
+    String html =
       "<!DOCTYPE html><html lang='en'><head>"
       "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
       "<title>LoRa Node " + nodeId + "</title>"
@@ -2520,69 +2519,71 @@ void setupServerRoutes() {
       ".section-title { font-weight:bold; font-size:1.1em; margin-top:20px; }"
       ".message-block { border:1px solid #ccc; margin:5px 0; padding:8px; border-radius:4px; }"
       ".message-block h4 { margin:0; font-size:0.9em; }"
-      ".message-block p { margin:4px 0; font-size:0.85em; }"
+      /* Force text wrapping for long content */
+      ".message-block p { margin:4px 0; font-size:0.85em; white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
+      ".details p { white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
       "</style></head><body>";
-      html +=
+    html +=
       "<div class='nav-links'>"
       "<a href='/'>Chat</a>"
       "<a href='/nodes'>Node List</a>"
       "<a href='/metrics'>History</a>"
       "</div>";
-      html += "<h2>LoRa Node: " + nodeId + "</h2>";
-      if(!found) {
-        html += "<div class='details'><p>No details available. This node hasn't been heard from or it's older than 24h.</p></div>";
-        html += "</body></html>";
-        request->send(200, "text/html", html);
-        return;
-      }
-      uint64_t ageMs = millis() - found->lastSeen;
-      String ageStr = formatRelativeTime(ageMs);
-      html += "<div class='details'>";
-      html += "<p><strong>Last RSSI:</strong> " + String(found->lastRSSI) + " dBm<br>";
-      html += "<strong>Last SNR:</strong> " + String(found->lastSNR) + " dB<br>";
-      html += "<strong>Last Seen:</strong> " + ageStr + "</p>";
-      const uint64_t ONE_DAY = 86400000;
-      bool anySample = false;
-      html += "<div class='section-title'>RSSI/SNR History (24hr)</div>";
-      html += "<table><thead><tr><th>Time Ago</th><th>RSSI (dBm)</th><th>SNR (dB)</th></tr></thead><tbody>";
-      for(auto &sample : found->history) {
-        uint64_t sampleAge = millis() - sample.timestamp;
-        if(sampleAge <= ONE_DAY) {
-          anySample = true;
-          html += "<tr>";
-          html += "<td>" + formatRelativeTime(sampleAge) + "</td>";
-          html += "<td>" + String(sample.rssi) + "</td>";
-          html += "<td>" + String(sample.snr,2) + "</td>";
-          html += "</tr>";
-        }
-      }
-      if(!anySample) {
-        html += "<tr><td colspan='3'>No samples in last 24 hours.</td></tr>";
-      }
-      html += "</tbody></table>";
-      auto nodeMsgs = getNodeMessages(nodeId);
-      html += "<div class='section-title'>Messages Sent/Relayed</div>";
-      if(nodeMsgs.empty()) {
-        html += "<p>No messages from or through this node.</p>";
-      } else {
-        for(auto it = nodeMsgs.rbegin(); it != nodeMsgs.rend(); ++it) {
-          uint64_t msgAgeMs = millis() - it->timeReceived;
-          String msgAgeStr = formatRelativeTime(msgAgeMs);
-          html += "<div class='message-block'>";
-          html += "<h4>Sender: " + it->sender + " | NodeID: " + it->nodeId + "</h4>";
-          html += "<p><strong>Content:</strong> " + it->content + "</p>";
-          html += "<p><strong>Source:</strong> " + it->source + "</p>";
-          if(!it->relayID.isEmpty()) {
-            html += "<p><strong>RelayID:</strong> " + it->relayID + "</p>";
-          }
-          html += "<p><em>" + msgAgeStr + "</em></p>";
-          html += "</div>";
-        }
-      }
-      html += "</div></body></html>";
+    html += "<h2>LoRa Node: " + nodeId + "</h2>";
+    if (!found) {
+      html += "<div class='details'><p>No details available. This node hasn't been heard from or it's older than 24h.</p></div>";
+      html += "</body></html>";
       request->send(200, "text/html", html);
+      return;
     }
-  });
+    uint64_t ageMs = millis() - found->lastSeen;
+    String ageStr = formatRelativeTime(ageMs);
+    html += "<div class='details'>";
+    html += "<p><strong>Last RSSI:</strong> " + String(found->lastRSSI) + " dBm<br>";
+    html += "<strong>Last SNR:</strong> " + String(found->lastSNR) + " dB<br>";
+    html += "<strong>Last Seen:</strong> " + ageStr + "</p>";
+    const uint64_t ONE_DAY = 86400000;
+    bool anySample = false;
+    html += "<div class='section-title'>RSSI/SNR History (24hr)</div>";
+    html += "<table><thead><tr><th>Time Ago</th><th>RSSI (dBm)</th><th>SNR (dB)</th></tr></thead><tbody>";
+    for (auto &sample : found->history) {
+      uint64_t sampleAge = millis() - sample.timestamp;
+      if (sampleAge <= ONE_DAY) {
+        anySample = true;
+        html += "<tr>";
+        html += "<td>" + formatRelativeTime(sampleAge) + "</td>";
+        html += "<td>" + String(sample.rssi) + "</td>";
+        html += "<td>" + String(sample.snr, 2) + "</td>";
+        html += "</tr>";
+      }
+    }
+    if (!anySample) {
+      html += "<tr><td colspan='3'>No samples in last 24 hours.</td></tr>";
+    }
+    html += "</tbody></table>";
+    auto nodeMsgs = getNodeMessages(nodeId);
+    html += "<div class='section-title'>Messages Sent/Relayed</div>";
+    if (nodeMsgs.empty()) {
+      html += "<p>No messages from or through this node.</p>";
+    } else {
+      for (auto it = nodeMsgs.rbegin(); it != nodeMsgs.rend(); ++it) {
+        uint64_t msgAgeMs = millis() - it->timeReceived;
+        String msgAgeStr = formatRelativeTime(msgAgeMs);
+        html += "<div class='message-block'>";
+        html += "<h4>Sender: " + it->sender + " | NodeID: " + it->nodeId + "</h4>";
+        html += "<p><strong>Content:</strong> " + it->content + "</p>";
+        html += "<p><strong>Source:</strong> " + it->source + "</p>";
+        if (!it->relayID.isEmpty()) {
+          html += "<p><strong>RelayID:</strong> " + it->relayID + "</p>";
+        }
+        html += "<p><em>" + msgAgeStr + "</em></p>";
+        html += "</div>";
+      }
+    }
+    html += "</div></body></html>";
+    request->send(200, "text/html", html);
+  }
+});
 }
 
 void updateMeshData() {
