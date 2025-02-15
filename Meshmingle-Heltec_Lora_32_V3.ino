@@ -25,6 +25,7 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 
+#define RADIOLIB_SX1262
 #define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
 #include <heltec_unofficial.h> // Heltec library for OLED and LoRa
 #include <painlessMesh.h>
