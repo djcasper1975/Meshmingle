@@ -1,5 +1,5 @@
-//Test v1.00.023
-//14-02-2025
+//Test v1.00.024 
+//15-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!!!!!
 //
@@ -16,6 +16,7 @@
 //circle and satalite diff sizes so circle is smaller.
 //overall performance is way better. next up to add is tx logs.
 //added agg heartbeat global variable to dissable it for now as its faulty.
+//better delays now preset for relaying. based on chip id. and incriments.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -56,12 +57,24 @@ struct TransmissionStatus {
   bool relayedViaWiFi = false;     // NEW: whether the message has been relayed via WiFi
   bool relayedViaLoRa = false;     // NEW: whether the message has been relayed via LoRa
   bool queuedForLoRa = false;      // NEW: whether the message is already queued for LoRa transmission
+  bool relayRetryAttempted = false; // NEW: whether a retry has already been attempted
   OriginChannel origin = ORIGIN_UNKNOWN; // NEW: track the origin (WiFi vs LoRa) of this message
   uint64_t timestamp = millis();   // record when the entry was created/updated
 };
 
 // Map to track transmissions by message ID
 std::map<String, TransmissionStatus> messageTransmissions;
+
+// ---------------------------------------------------------------------
+// NEW: Relay Log Definitions
+// ---------------------------------------------------------------------
+struct RelayLogEntry {
+  String relayID;
+  uint64_t timestamp;
+};
+
+// Global relay log: maps messageID to a vector of relay log entries.
+std::map<String, std::vector<RelayLogEntry>> relayLog;
 
 // -----------------------
 // (Other functions, e.g. cleanupMessageTransmissions(), LoRa setup, mesh setup, etc., remain unchanged.)
@@ -475,15 +488,17 @@ void scheduleLoRaTransmission(String message) {
 
     // [MODIFIED]:
     // If the message is from a remote node (relayID != myId),
-    // add an extra random delay (between 3000 and 13,000 ms) on top of the global_jitter_offset.
+    // use a deterministic extra delay selected from 10 discrete slots ranging from 3500ms to 35000ms.
     if (relayID != myId) {
         String newRelayID = myId;
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
         loraTransmissionQueue.push_back(updatedMessage);
         status.queuedForLoRa = true;
         if (loraTransmissionQueue.size() == 1) {
-            unsigned long extraDelay = random(3000, 13000); // extra random delay between 3000ms and 13,000ms
-            loRaTransmitDelay = millis() + global_jitter_offset + extraDelay;
+            const unsigned long delayOptions[10] = {3500, 7000, 10500, 14000, 17500, 21000, 24500, 28000, 31500, 35000};
+            int slot = (ESP.getEfuseMac() & 0xFFFF) % 10;
+            unsigned long extraDelay = delayOptions[slot];
+            loRaTransmitDelay = millis() + extraDelay;
         }
         Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
                       newRelayID.c_str(), loRaTransmitDelay - millis(), updatedMessage.c_str());
@@ -713,8 +728,6 @@ void transmitWithDutyCycle(const String& message) {
     return;
   }
 
-  // Removed the radio.available() check to avoid waiting for RX clearance.
-
   // Extract the messageID from the message (assumes message format is valid).
   int separatorIndex = message.indexOf('|');
   if (separatorIndex == -1) {
@@ -722,8 +735,6 @@ void transmitWithDutyCycle(const String& message) {
     return;
   }
   String messageID = message.substring(0, separatorIndex);
-  
-  // (We no longer check if already transmitted; every node with the queued copy will transmit.)
   
   // Record the transmission start time and transmit the message.
   tx_time = millis();
@@ -735,17 +746,19 @@ void transmitWithDutyCycle(const String& message) {
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
-    // Mark this node's own transmission as successful.
+    // Mark as successfully transmitted via LoRa.
     messageTransmissions[messageID].transmittedViaLoRa = true;
     messageTransmissions[messageID].relayedViaLoRa = true;
     // Clear the queued flag so that future scheduling is possible.
     messageTransmissions[messageID].queuedForLoRa = false;
+    // Reset retry flag.
+    messageTransmissions[messageID].relayRetryAttempted = false;
     calculateDutyCyclePause(tx_time);
     last_tx = millis();
     drawMainScreen(tx_time);
     radio.startReceive();
 
-    // After successful transmission, forward the message via WiFi if it's not a heartbeat.
+    // After successful transmission, forward via WiFi if appropriate.
     if (!message.startsWith("HEARTBEAT|")) {
       if (messageTransmissions[messageID].origin == ORIGIN_LORA) {
           transmitViaWiFi(message);
@@ -754,16 +767,36 @@ void transmitWithDutyCycle(const String& message) {
       }
     }
 
-    // Remove the queued copy once transmitted.
+    // Remove only the top entry (the one just transmitted) from the relay queue.
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
+      Serial.printf("[LoRa Tx] Removed top queued entry for message %s\n", messageID.c_str());
     }
+    
+    // Since our node relayed successfully, remove the relay log for this message.
+    relayLog.erase(messageID);
+    
     // Schedule next transmission if any remain.
     if (!loraTransmissionQueue.empty()) {
       loRaTransmitDelay = millis() + global_jitter_offset;
     }
   } else {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
+    // If a retry has not yet been attempted, schedule one more attempt.
+    if (!messageTransmissions[messageID].relayRetryAttempted) {
+      messageTransmissions[messageID].relayRetryAttempted = true;
+      unsigned long extraDelay = random(3000, 13000); // random delay between 3000ms and 13000ms
+      loRaTransmitDelay = millis() + global_jitter_offset + extraDelay;
+      Serial.printf("[LoRa Tx] Scheduling a retry for message %s in %lu ms\n", messageID.c_str(), loRaTransmitDelay - millis());
+      // Do not remove the queued entry so that it gets retried.
+    } else {
+      // Already retried once; clear the queued flag and remove the top entry.
+      messageTransmissions[messageID].queuedForLoRa = false;
+      if (!loraTransmissionQueue.empty()) {
+        loraTransmissionQueue.erase(loraTransmissionQueue.begin());
+        Serial.printf("[LoRa Tx] Removing top queued entry for message %s after retry failure\n", messageID.c_str());
+      }
+    }
   }
 }
 
@@ -822,14 +855,6 @@ void sendAggregatedHeartbeat() {
   }
   
   String aggMsgWithoutCRC = "AGG_HEARTBEAT|" + getCustomNodeId(getNodeId());
-  
-  // Old behavior: iterating through all LoRa nodes:
-  // for (auto const &pair : loraNodes) {
-  //   const LoRaNode &loraNode = pair.second;
-  //   if (loraNode.nodeId != getCustomNodeId(getNodeId())) {
-  //     aggMsgWithoutCRC += "|" + loraNode.nodeId;
-  //   }
-  // }
   
   // New behavior: advertise only your direct mesh nodes (0-hop)
   auto directNodes = mesh.getNodeList();
@@ -1015,59 +1040,60 @@ void loop() {
               Serial.println("[LoRa Rx] Own heartbeat, ignore.");
             }
           }
-else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-  Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
-  // Extract the sender of the aggregated heartbeat (the node that transmitted it)
-  int firstSep = messageWithoutCRC.indexOf('|');
-  if (firstSep == -1) {
-    Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
-  } else {
-    String senderRelayId = messageWithoutCRC.substring(firstSep + 1, messageWithoutCRC.indexOf('|', firstSep + 1));
-    // Now process the remaining fields as direct neighbors of senderRelayId
-    int startPos = messageWithoutCRC.indexOf('|', firstSep + 1) + 1;
-    while (true) {
-      int nextSep = messageWithoutCRC.indexOf('|', startPos);
-      String neighborId;
-      if (nextSep == -1) {
-        neighborId = messageWithoutCRC.substring(startPos);
-      } else {
-        neighborId = messageWithoutCRC.substring(startPos, nextSep);
-      }
-      
-      if (neighborId.length() > 0 && neighborId != getCustomNodeId(getNodeId())) {
-        // Here, update your 1-hop (indirect) node list
-        uint64_t currentTime = millis();
-        int rssi = radio.getRSSI();
-        float snr = radio.getSNR();
-        
-        // Use a composite key to store these nodes
-        String key = neighborId + "-" + senderRelayId;
-        auto it = indirectNodes.find(key);
-        if (it != indirectNodes.end()) {
-          it->second.lastSeen = currentTime;
-          it->second.rssi = rssi;
-          it->second.snr = snr;
-          // Optionally update history if needed
-        } else {
-          IndirectNode indNode;
-          indNode.originatorId = neighborId;
-          indNode.relayId = senderRelayId;
-          indNode.rssi = rssi;
-          indNode.snr = snr;
-          indNode.lastSeen = currentTime;
-          indNode.statusEmoji = "🛰️";  // Mark as 1-hop from senderRelayId
-          indirectNodes[key] = indNode;
-        }
-        Serial.printf("[Indirect Nodes] Updated 1-hop indirect node: Originator: %s, via Relay: %s, RSSI: %d, SNR: %.2f\n",
-                      neighborId.c_str(), senderRelayId.c_str(), rssi, snr);
-      }
-      
-      if (nextSep == -1) break;
-      startPos = nextSep + 1;
-    }
-  }
-}
+          else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+            Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
+            // Extract the sender of the aggregated heartbeat (the node that transmitted it)
+            int firstSep = messageWithoutCRC.indexOf('|');
+            if (firstSep == -1) {
+              Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
+            } else {
+              String senderRelayId = messageWithoutCRC.substring(firstSep + 1, messageWithoutCRC.indexOf('|', firstSep + 1));
+              // Now process the remaining fields as direct neighbors of senderRelayId
+              int startPos = messageWithoutCRC.indexOf('|', firstSep + 1) + 1;
+              while (true) {
+                int nextSep = messageWithoutCRC.indexOf('|', startPos);
+                String neighborId;
+                if (nextSep == -1) {
+                  neighborId = messageWithoutCRC.substring(startPos);
+                } else {
+                  neighborId = messageWithoutCRC.substring(startPos, nextSep);
+                }
+                
+                if (neighborId.length() > 0 && neighborId != getCustomNodeId(getNodeId())) {
+                  // Here, update your 1-hop (indirect) node list
+                  uint64_t currentTime = millis();
+                  int rssi = radio.getRSSI();
+                  float snr = radio.getSNR();
+                  
+                  // Use a composite key to store these nodes
+                  String key = neighborId + "-" + senderRelayId;
+                  auto it = indirectNodes.find(key);
+                  if (it != indirectNodes.end()) {
+                    it->second.lastSeen = currentTime;
+                    it->second.rssi = rssi;
+                    it->second.snr = snr;
+                    // Optionally update history if needed
+                  } else {
+                    IndirectNode indNode;
+                    indNode.originatorId = neighborId;
+                    indNode.relayId = senderRelayId;
+                    indNode.rssi = rssi;
+                    indNode.snr = snr;
+                    indNode.lastSeen = currentTime;
+                    indNode.statusEmoji = "🛰️";  // Mark as 1-hop from senderRelayId
+                    indirectNodes[key] = indNode;
+                  }
+                  Serial.printf("[Indirect Nodes] Updated 1-hop indirect node: Originator: %s, via Relay: %s, RSSI: %d, SNR: %.2f\n",
+                                neighborId.c_str(), senderRelayId.c_str(), rssi, snr);
+                }
+                
+                if (nextSep == -1) break;
+                startPos = nextSep + 1;
+              }
+            }
+          }
           else {
+            // For non-heartbeat messages, parse fields.
             int firstSeparator = messageWithoutCRC.indexOf('|');
             int secondSeparator = messageWithoutCRC.indexOf('|', firstSeparator + 1);
             int thirdSeparator = messageWithoutCRC.indexOf('|', secondSeparator + 1);
@@ -1169,6 +1195,33 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
                                     originatorID.c_str(), relayID.c_str(), rssi, snr);
                   }
                 }
+              }
+
+              // --- NEW: Relay Log Update ---
+              // For non-heartbeat messages, log the relayID.
+              bool alreadyLogged = false;
+              if (relayLog.find(messageID) != relayLog.end()) {
+                for (auto &entry : relayLog[messageID]) {
+                  if (entry.relayID == relayID) { 
+                    alreadyLogged = true; 
+                    break; 
+                  }
+                }
+                if (!alreadyLogged) {
+                  RelayLogEntry newEntry = { relayID, millis() };
+                  relayLog[messageID].push_back(newEntry);
+                  Serial.printf("[Relay Log] New relay %s for message %s added.\n", relayID.c_str(), messageID.c_str());
+                }
+              } else {
+                relayLog[messageID] = { { relayID, millis() } };
+                Serial.printf("[Relay Log] Created new relay log for message %s with relay %s.\n", messageID.c_str(), relayID.c_str());
+              }
+              
+              // If our node has not yet relayed this message and there is a relay log entry,
+              // force a relay attempt.
+              if (!status.relayedViaLoRa && !status.queuedForLoRa) {
+                  Serial.printf("[Relay Log] Forcing relay attempt for message %s due to new relay log entry.\n", messageID.c_str());
+                  scheduleLoRaTransmission(message);
               }
             }
           }
