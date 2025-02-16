@@ -1,5 +1,5 @@
-//Test v1.00.024 
-//15-02-2025
+//Test v1.00.025 
+//16-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!!!!!
 //
@@ -10,6 +10,7 @@
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //fixed html page issues
 //Added Rx Boost
+//important performance updates.
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -916,11 +917,11 @@ void setup() {
 
   RADIOLIB_OR_HALT(radio.begin());
   radio.setDio1Action(onRadioRx);
-if(enableRxBoost) {
-  RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));  // Enable boosted RX mode
-} else {
-  RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(false)); // Disable boosted RX mode
-}
+  if(enableRxBoost) {
+    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));  // Enable boosted RX mode
+  } else {
+    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(false)); // Disable boosted RX mode
+  }
   RADIOLIB_OR_HALT(radio.setFrequency(FREQUENCY));
   RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
   RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
@@ -933,7 +934,16 @@ if(enableRxBoost) {
   WiFi.softAP(MESH_SSID, MESH_PASSWORD);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
-  initMesh();
+  // Initialize mesh networking
+  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
+  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT);
+  mesh.onReceive(receivedCallback);
+  mesh.onChangedConnections([]() {
+    updateMeshData();
+  });
+  mesh.setContainsRoot(false);
+
+  // Setup server routes
   setupServerRoutes();
   server.begin();
   dnsServer.start(53, "*", WiFi.softAPIP());
@@ -2457,134 +2467,134 @@ void setupServerRoutes() {
     request->send(200, "application/json", json);
   });
 
-server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request) {
-  if (!request->hasParam("nodeId")) {
-    String html =
-      "<!DOCTYPE html><html lang='en'><head>"
-      "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-      "<title>LoRa Nodes List</title>"
-      "<style>"
-      "body { font-family: Arial, sans-serif; background-color: #f4f7f6; margin:0; padding:20px; }"
-      ".nav-links { text-align:center; margin-bottom:20px; background-color:#eee; padding:10px; }"
-      ".nav-links a { margin:0 15px; text-decoration:none; color:#007bff; font-weight:bold; }"
-      ".nav-links a:hover { text-decoration:underline; }"
-      "h2 { text-align:center; color:#333; }"
-      ".node-list { max-width:600px; margin:10px auto; background:#fff; padding:10px; border-radius:8px; }"
-      ".node-link { display:block; padding:8px; border-bottom:1px solid #ccc; color:#007bff; text-decoration:none; }"
-      ".node-link:hover { background-color:#f0f0f0; }"
-      "</style>"
-      "</head><body>"
-      "<div class='nav-links'>"
-      "<a href='/'>Chat</a>"
-      "<a href='/nodes'>All Nodes</a>"
-      "<a href='/metrics'>History</a>"
-      "</div>"
-      "<h2>LoRa Node Details</h2>"
-      "<p style='text-align:center;'>Select a LoRa node to see metrics and messages.</p>"
-      "<div class='node-list'>";
-    uint64_t currentTime = millis();
-    const uint64_t FIFTEEN_MINUTES = 900000;
-    bool anyLoRa = false;
-    for (auto &kv : loraNodes) {
-      if (currentTime - kv.second.lastSeen <= FIFTEEN_MINUTES) {
-        anyLoRa = true;
-        html += "<a class='node-link' href='/loraDetails?nodeId=" + kv.first + "'>"
-                + kv.first + "</a>";
-      }
-    }
-    if (!anyLoRa) {
-      html += "<p>No LoRa nodes seen in last 15 minutes.</p>";
-    }
-    html += "</div></body></html>";
-    request->send(200, "text/html", html);
-  } else {
-    String nodeId = request->getParam("nodeId")->value();
-    LoRaNode *found = nullptr;
-    if (loraNodes.find(nodeId) != loraNodes.end()) {
-      found = &loraNodes[nodeId];
-    }
-    String html =
-      "<!DOCTYPE html><html lang='en'><head>"
-      "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-      "<title>LoRa Node " + nodeId + "</title>"
-      "<style>"
-      "body { font-family: Arial, sans-serif; background-color: #f4f7f6; margin:0; padding:20px; }"
-      ".nav-links { text-align:center; margin-bottom:20px; background-color:#eee; padding:10px; }"
-      ".nav-links a { margin:0 15px; text-decoration:none; color:#007bff; font-weight:bold; }"
-      ".nav-links a:hover { text-decoration:underline; }"
-      "h2 { text-align:center; color:#333; }"
-      ".details { max-width:600px; margin:10px auto; background:#fff; padding:10px; border-radius:8px; }"
-      "table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }"
-      "th, td { border: 1px solid #ccc; padding: 5px; text-align:left; font-size:0.9em; }"
-      "th { background-color:#eee; }"
-      ".section-title { font-weight:bold; font-size:1.1em; margin-top:20px; }"
-      ".message-block { border:1px solid #ccc; margin:5px 0; padding:8px; border-radius:4px; }"
-      ".message-block h4 { margin:0; font-size:0.9em; }"
-      /* Force text wrapping for long content */
-      ".message-block p { margin:4px 0; font-size:0.85em; white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
-      ".details p { white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
-      "</style></head><body>";
-    html +=
-      "<div class='nav-links'>"
-      "<a href='/'>Chat</a>"
-      "<a href='/nodes'>Node List</a>"
-      "<a href='/metrics'>History</a>"
-      "</div>";
-    html += "<h2>LoRa Node: " + nodeId + "</h2>";
-    if (!found) {
-      html += "<div class='details'><p>No details available. This node hasn't been heard from or it's older than 24h.</p></div>";
-      html += "</body></html>";
-      request->send(200, "text/html", html);
-      return;
-    }
-    uint64_t ageMs = millis() - found->lastSeen;
-    String ageStr = formatRelativeTime(ageMs);
-    html += "<div class='details'>";
-    html += "<p><strong>Last RSSI:</strong> " + String(found->lastRSSI) + " dBm<br>";
-    html += "<strong>Last SNR:</strong> " + String(found->lastSNR) + " dB<br>";
-    html += "<strong>Last Seen:</strong> " + ageStr + "</p>";
-    const uint64_t ONE_DAY = 86400000;
-    bool anySample = false;
-    html += "<div class='section-title'>RSSI/SNR History (24hr)</div>";
-    html += "<table><thead><tr><th>Time Ago</th><th>RSSI (dBm)</th><th>SNR (dB)</th></tr></thead><tbody>";
-    for (auto &sample : found->history) {
-      uint64_t sampleAge = millis() - sample.timestamp;
-      if (sampleAge <= ONE_DAY) {
-        anySample = true;
-        html += "<tr>";
-        html += "<td>" + formatRelativeTime(sampleAge) + "</td>";
-        html += "<td>" + String(sample.rssi) + "</td>";
-        html += "<td>" + String(sample.snr, 2) + "</td>";
-        html += "</tr>";
-      }
-    }
-    if (!anySample) {
-      html += "<tr><td colspan='3'>No samples in last 24 hours.</td></tr>";
-    }
-    html += "</tbody></table>";
-    auto nodeMsgs = getNodeMessages(nodeId);
-    html += "<div class='section-title'>Messages Sent/Relayed</div>";
-    if (nodeMsgs.empty()) {
-      html += "<p>No messages from or through this node.</p>";
-    } else {
-      for (auto it = nodeMsgs.rbegin(); it != nodeMsgs.rend(); ++it) {
-        uint64_t msgAgeMs = millis() - it->timeReceived;
-        String msgAgeStr = formatRelativeTime(msgAgeMs);
-        html += "<div class='message-block'>";
-        html += "<h4>Sender: " + it->sender + " | NodeID: " + it->nodeId + "</h4>";
-        html += "<p><strong>Content:</strong> " + it->content + "</p>";
-        html += "<p><strong>Source:</strong> " + it->source + "</p>";
-        if (!it->relayID.isEmpty()) {
-          html += "<p><strong>RelayID:</strong> " + it->relayID + "</p>";
+  server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("nodeId")) {
+      String html =
+        "<!DOCTYPE html><html lang='en'><head>"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+        "<title>LoRa Nodes List</title>"
+        "<style>"
+        "body { font-family: Arial, sans-serif; background-color: #f4f7f6; margin:0; padding:20px; }"
+        ".nav-links { text-align:center; margin-bottom:20px; background-color:#eee; padding:10px; }"
+        ".nav-links a { margin:0 15px; text-decoration:none; color:#007bff; font-weight:bold; }"
+        ".nav-links a:hover { text-decoration:underline; }"
+        "h2 { text-align:center; color:#333; }"
+        ".node-list { max-width:600px; margin:10px auto; background:#fff; padding:10px; border-radius:8px; }"
+        ".node-link { display:block; padding:8px; border-bottom:1px solid #ccc; color:#007bff; text-decoration:none; }"
+        ".node-link:hover { background-color:#f0f0f0; }"
+        "</style>"
+        "</head><body>"
+        "<div class='nav-links'>"
+        "<a href='/'>Chat</a>"
+        "<a href='/nodes'>All Nodes</a>"
+        "<a href='/metrics'>History</a>"
+        "</div>"
+        "<h2>LoRa Node Details</h2>"
+        "<p style='text-align:center;'>Select a LoRa node to see metrics and messages.</p>"
+        "<div class='node-list'>";
+      uint64_t currentTime = millis();
+      const uint64_t FIFTEEN_MINUTES = 900000;
+      bool anyLoRa = false;
+      for (auto &kv : loraNodes) {
+        if (currentTime - kv.second.lastSeen <= FIFTEEN_MINUTES) {
+          anyLoRa = true;
+          html += "<a class='node-link' href='/loraDetails?nodeId=" + kv.first + "'>"
+                  + kv.first + "</a>";
         }
-        html += "<p><em>" + msgAgeStr + "</em></p>";
-        html += "</div>";
       }
+      if (!anyLoRa) {
+        html += "<p>No LoRa nodes seen in last 15 minutes.</p>";
+      }
+      html += "</div></body></html>";
+      request->send(200, "text/html", html);
+    } else {
+      String nodeId = request->getParam("nodeId")->value();
+      LoRaNode *found = nullptr;
+      if (loraNodes.find(nodeId) != loraNodes.end()) {
+        found = &loraNodes[nodeId];
+      }
+      String html =
+        "<!DOCTYPE html><html lang='en'><head>"
+        "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+        "<title>LoRa Node " + nodeId + "</title>"
+        "<style>"
+        "body { font-family: Arial, sans-serif; background-color: #f4f7f6; margin:0; padding:20px; }"
+        ".nav-links { text-align:center; margin-bottom:20px; background-color:#eee; padding:10px; }"
+        ".nav-links a { margin:0 15px; text-decoration:none; color:#007bff; font-weight:bold; }"
+        ".nav-links a:hover { text-decoration:underline; }"
+        "h2 { text-align:center; color:#333; }"
+        ".details { max-width:600px; margin:10px auto; background:#fff; padding:10px; border-radius:8px; }"
+        "table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }"
+        "th, td { border: 1px solid #ccc; padding: 5px; text-align:left; font-size:0.9em; }"
+        "th { background-color:#eee; }"
+        ".section-title { font-weight:bold; font-size:1.1em; margin-top:20px; }"
+        ".message-block { border:1px solid #ccc; margin:5px 0; padding:8px; border-radius:4px; }"
+        ".message-block h4 { margin:0; font-size:0.9em; }"
+        /* Force text wrapping for long content */
+        ".message-block p { margin:4px 0; font-size:0.85em; white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
+        ".details p { white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
+        "</style></head><body>";
+      html +=
+        "<div class='nav-links'>"
+        "<a href='/'>Chat</a>"
+        "<a href='/nodes'>Node List</a>"
+        "<a href='/metrics'>History</a>"
+        "</div>";
+      html += "<h2>LoRa Node: " + nodeId + "</h2>";
+      if (!found) {
+        html += "<div class='details'><p>No details available. This node hasn't been heard from or it's older than 24h.</p></div>";
+        html += "</body></html>";
+        request->send(200, "text/html", html);
+        return;
+      }
+      uint64_t ageMs = millis() - found->lastSeen;
+      String ageStr = formatRelativeTime(ageMs);
+      html += "<div class='details'>";
+      html += "<p><strong>Last RSSI:</strong> " + String(found->lastRSSI) + " dBm<br>";
+      html += "<strong>Last SNR:</strong> " + String(found->lastSNR) + " dB<br>";
+      html += "<strong>Last Seen:</strong> " + ageStr + "</p>";
+      const uint64_t ONE_DAY = 86400000;
+      bool anySample = false;
+      html += "<div class='section-title'>RSSI/SNR History (24hr)</div>";
+      html += "<table><thead><tr><th>Time Ago</th><th>RSSI (dBm)</th><th>SNR (dB)</th></tr></thead><tbody>";
+      for (auto &sample : found->history) {
+        uint64_t sampleAge = millis() - sample.timestamp;
+        if (sampleAge <= ONE_DAY) {
+          anySample = true;
+          html += "<tr>";
+          html += "<td>" + formatRelativeTime(sampleAge) + "</td>";
+          html += "<td>" + String(sample.rssi) + "</td>";
+          html += "<td>" + String(sample.snr, 2) + "</td>";
+          html += "</tr>";
+        }
+      }
+      if (!anySample) {
+        html += "<tr><td colspan='3'>No samples in last 24 hours.</td></tr>";
+      }
+      html += "</tbody></table>";
+      auto nodeMsgs = getNodeMessages(nodeId);
+      html += "<div class='section-title'>Messages Sent/Relayed</div>";
+      if (nodeMsgs.empty()) {
+        html += "<p>No messages from or through this node.</p>";
+      } else {
+        for (auto it = nodeMsgs.rbegin(); it != nodeMsgs.rend(); ++it) {
+          uint64_t msgAgeMs = millis() - it->timeReceived;
+          String msgAgeStr = formatRelativeTime(msgAgeMs);
+          html += "<div class='message-block'>";
+          html += "<h4>Sender: " + it->sender + " | NodeID: " + it->nodeId + "</h4>";
+          html += "<p><strong>Content:</strong> " + it->content + "</p>";
+          html += "<p><strong>Source:</strong> " + it->source + "</p>";
+          if (!it->relayID.isEmpty()) {
+            html += "<p><strong>RelayID:</strong> " + it->relayID + "</p>";
+          }
+          html += "<p><em>" + msgAgeStr + "</em></p>";
+          html += "</div>";
+        }
+      }
+      html += "</div></body></html>";
+      request->send(200, "text/html", html);
     }
-    html += "</div></body></html>";
-    request->send(200, "text/html", html);
-  }
-});
+  });
 }
 
 void updateMeshData() {
@@ -2620,3 +2630,4 @@ int getNodeCount() {
 void initServer() {
   setupServerRoutes();
 }
+
