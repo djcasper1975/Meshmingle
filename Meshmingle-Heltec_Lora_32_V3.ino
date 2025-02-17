@@ -11,6 +11,7 @@
 //fixed html page issues
 //Added Rx Boost
 //important performance updates.
+//wifi was relaying way too much causing flag resets for lora relays when lora and wifi in range multiple nodes close.
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -2290,8 +2291,7 @@ void setupServerRoutes() {
         json += "\"" + rid + "\"";
         firstRelay = false;
       }
-      json += "]";
-      json += "}";
+      json += "]}";
       first = false;
     }
     json += "], \"currentDeviceTime\":" + String(millis()) + "}";
@@ -2383,6 +2383,7 @@ void setupServerRoutes() {
 
     messageTransmissions[messageID].origin = ORIGIN_WIFI;
 
+    // Transmit via WiFi and schedule LoRa transmission as before
     transmitViaWiFi(constructedMessage);
     scheduleLoRaTransmission(constructedMessage);
     request->redirect("/");
@@ -2462,8 +2463,7 @@ void setupServerRoutes() {
       }
       json += "],\"statusEmoji\":\"" + node.statusEmoji + "\"}";
     }
-    json += "]";
-    json += "}";
+    json += "]}";
     request->send(200, "application/json", json);
   });
 
@@ -2530,7 +2530,7 @@ void setupServerRoutes() {
         ".section-title { font-weight:bold; font-size:1.1em; margin-top:20px; }"
         ".message-block { border:1px solid #ccc; margin:5px 0; padding:8px; border-radius:4px; }"
         ".message-block h4 { margin:0; font-size:0.9em; }"
-        /* Force text wrapping for long content */
+        "/* Force text wrapping for long content */"
         ".message-block p { margin:4px 0; font-size:0.85em; white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
         ".details p { white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
         "</style></head><body>";
@@ -2630,4 +2630,3 @@ int getNodeCount() {
 void initServer() {
   setupServerRoutes();
 }
-
