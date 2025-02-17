@@ -1,17 +1,18 @@
-//Test v1.00.025 
-//16-02-2025
+//Test v1.00.026 
+//17-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!!!!!
 //
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
-//After Accounting for Heartbeats: 20 sec after boot then every 15 mins therafter.
+//After Accounting for Heartbeats: 20 sec after boot then every 15 mins thereafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //fixed html page issues
 //Added Rx Boost
 //important performance updates.
 //wifi was relaying way too much causing flag resets for lora relays when lora and wifi in range multiple nodes close.
+//added support for heltec v3.2
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -20,6 +21,7 @@
 // M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
+
 
 #define RADIOLIB_SX1262
 #define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
@@ -51,7 +53,7 @@
 // Some Global Variables
 bool enableRxBoost = true; //enable or disable RX Boost Mode
 bool sendAggregatedHeartbeats = false;  //0 hop nodelist sharing. Theres issues with this right now!!!!
-bool bypassDutyCycle = false;  // Enable or Dissable DutyCycle (For Non EU Use ONLY!!!)
+bool bypassDutyCycle = false;  // Enable or Disable DutyCycle (For Non EU Use ONLY!!!)
 
 // ---------------------------------------------------------------------
 // NEW: Define an enum to track the origin of each message
@@ -347,44 +349,34 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
 
   auto& status = messageTransmissions[messageID];
 
-  // If the message has already been added...
+  // Early exit if message already processed.
   if (status.addedToMessages) {
-    // Look for the existing message in the messages vector.
-    for (auto &msg : messages) {
-      if (msg.messageID == messageID) {
-        String myId = getCustomNodeId(getNodeId());
-        // For messages originating from our node, update the relay info if we receive a LoRa update
-        // that shows a relayID different from our own.
-        if (msg.nodeId == myId) {
-          if (source == "[LoRa]" && relayID != myId) {
-            if (msg.relayIDs.size() == 0) {
-              Serial.printf("Updating our message %s with relay info from %s\n", messageID.c_str(), relayID.c_str());
-              msg.source = "[LoRa]";
-              msg.rssi = rssi;
-              msg.snr = snr;
-              msg.relayID = relayID;
-              msg.relayIDs.push_back(relayID);
-            } else {
-              bool exists = false;
-              for (auto &id : msg.relayIDs) {
-                if (id == relayID) { exists = true; break; }
-              }
-              if (!exists) {
-                msg.relayIDs.push_back(relayID);
-              }
+    // Optionally update relayIDs if needed
+    if (source == "[LoRa]") {
+      // For our own message, if we get a new relayID different from our own, update relayIDs.
+      String myId = getCustomNodeId(getNodeId());
+      for (auto &msg : messages) {
+        if (msg.messageID == messageID) {
+          if (msg.nodeId == myId && relayID != myId) {
+            bool exists = false;
+            for (auto &id : msg.relayIDs) {
+              if (id == relayID) { exists = true; break; }
             }
+            if (!exists) {
+              Serial.printf("Updating our message %s with relay info from %s\n", messageID.c_str(), relayID.c_str());
+              msg.relayIDs.push_back(relayID);
+            }
+          }
+          // Also, if a message received via WiFi now comes with LoRa details, update them.
+          if (source == "[LoRa]" && msg.source != "[LoRa]") {
+            Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
+            msg.source = "[LoRa]";
+            msg.rssi   = rssi;
+            msg.snr    = snr;
+            msg.relayID = relayID;
           }
           break;
         }
-        // For messages not from our node, if the new message is from LoRa but the stored one is not, update it.
-        if (source == "[LoRa]" && msg.source != "[LoRa]") {
-          Serial.printf("Updating message %s from WiFi to LoRa details\n", messageID.c_str());
-          msg.source = "[LoRa]";
-          msg.rssi   = rssi;   // update RSSI
-          msg.snr    = snr;    // update SNR
-          msg.relayID = relayID; // optionally update relayID if needed
-        }
-        break;
       }
     }
     return;
@@ -485,7 +477,7 @@ void scheduleLoRaTransmission(String message) {
 
     // [MODIFIED]:
     // If the message is from a remote node (relayID != myId),
-    // use a deterministic extra delay selected from 10 discrete slots ranging from 3500ms to 35000ms.
+    // use a deterministic extra delay selected from 10 discrete slots.
     if (relayID != myId) {
         String newRelayID = myId;
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
@@ -512,27 +504,22 @@ void scheduleLoRaTransmission(String message) {
 }
 
 void transmitViaWiFi(const String& message) {
-  Serial.printf("[WiFi Tx] Preparing to transmit: %s\n", message.c_str());
-  if (message.startsWith("HEARTBEAT|")) {
-    Serial.println("[WiFi Tx] Skipping heartbeat over WiFi.");
-    return;
-  }
-
+  // Early exit if already transmitted via WiFi.
   int separatorIndex = message.indexOf('|');
   if (separatorIndex == -1) {
     Serial.println("[WiFi Tx] Invalid format.");
     return;
   }
   String messageID = message.substring(0, separatorIndex);
-
   auto& status = messageTransmissions[messageID];
   if (status.transmittedViaWiFi) {
     Serial.println("[WiFi Tx] Already sent via WiFi, skipping...");
     return;
   }
-
-  mesh.sendBroadcast(message);
+  
+  // Mark as transmitted via WiFi immediately.
   status.transmittedViaWiFi = true;
+  mesh.sendBroadcast(message);
   Serial.printf("[WiFi Tx] Sent: %s\n", message.c_str());
 }
 
@@ -658,7 +645,6 @@ void drawMainScreen(long txTimeMillis = -1) {
   display.display();
 }
 
-
 void displayCarousel() {
   unsigned long currentMillis = millis();
   if (currentMillis - lastCarouselChange >= carouselInterval) {
@@ -707,7 +693,6 @@ void displayCarousel() {
   }
 }
 
-
 long lastTxTimeMillisVar = -1;
 
 void transmitWithDutyCycle(const String& message) {
@@ -753,17 +738,19 @@ void transmitWithDutyCycle(const String& message) {
     calculateDutyCyclePause(tx_time);
     last_tx = millis();
     drawMainScreen(tx_time);
+    
+    // OPTIONAL: If needed, insert a short delay here.
+    // delay(50);
+    
     radio.startReceive();
-
-    // After successful transmission, forward via WiFi if appropriate.
-    if (!message.startsWith("HEARTBEAT|")) {
-      // If the message is pending a WiFi relay, relay it now.
-      if (messageTransmissions[messageID].pendingWiFiRelay) {
-          transmitViaWiFi(message);
-          messageTransmissions[messageID].pendingWiFiRelay = false;
-      }
+    
+    // Channel Isolation:
+    // After LoRa Tx, if a WiFi relay was pending, perform it and mark it so no further WiFi relay occurs.
+    if (messageTransmissions[messageID].pendingWiFiRelay) {
+      transmitViaWiFi(message);
+      messageTransmissions[messageID].pendingWiFiRelay = false;
     }
-
+    
     // Remove only the top entry (the one just transmitted) from the relay queue.
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
@@ -773,10 +760,7 @@ void transmitWithDutyCycle(const String& message) {
     // Since our node relayed successfully, remove the relay log for this message.
     relayLog.erase(messageID);
     
-    // Schedule next transmission if any remain.
-    if (!loraTransmissionQueue.empty()) {
-      loRaTransmitDelay = millis() + global_jitter_offset;
-    }
+    // The message is now fully relayed on LoRa.
   } else {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
     // If a retry has not yet been attempted, schedule one more attempt.
@@ -908,8 +892,11 @@ void setup() {
   heltec_setup();
   Serial.println("Initializing LoRa radio...");
   heltec_led(0);
-
+  pinMode(Vext, OUTPUT);   
+  digitalWrite(Vext, LOW);  
+  delay(100);  
   display.init();
+  display.setContrast(255);
   display.flipScreenVertically();
   display.clear();
   display.setFont(ArialMT_Plain_10);
@@ -1227,6 +1214,7 @@ void loop() {
                 Serial.printf("[Relay Log] Created new relay log for message %s with relay %s.\n", messageID.c_str(), relayID.c_str());
               }
               
+              // Channel Isolation:
               // If our node has not yet relayed this message and there is a relay log entry,
               // force a relay attempt.
               if (!status.relayedViaLoRa && !status.queuedForLoRa) {
@@ -2251,11 +2239,19 @@ String formatRelativeTime(uint64_t ageMs) {
 }
 
 // --- Helper to filter messages for a given node ---
+// UPDATED: Now checks if the nodeId is in the relayIDs vector as well.
 std::vector<Message> getNodeMessages(const String& nodeId) {
   std::vector<Message> result;
   for (auto &m : messages) {
     if (m.recipient != "ALL") continue;
-    if (m.nodeId == nodeId || m.relayID == nodeId) {
+    bool inRelayList = false;
+    for (auto &rid : m.relayIDs) {
+      if (rid == nodeId) { 
+        inRelayList = true; 
+        break; 
+      }
+    }
+    if (m.nodeId == nodeId || m.relayID == nodeId || inRelayList) {
       result.push_back(m);
     }
   }
@@ -2334,18 +2330,16 @@ void setupServerRoutes() {
     json += "], \"indirectNodes\":[";
     bool firstIndirect = true;
     const uint64_t THIRTY_ONE_MINUTES = 1860000;
-    for (auto const& kv : indirectNodes) {
-      const auto &node = kv.second;
-      if (currentTime - node.lastSeen <= THIRTY_ONE_MINUTES) {
-        if (!firstIndirect) json += ",";
-        json += "{\"originatorId\":\"" + node.originatorId + "\"," 
-              + "\"relayId\":\"" + node.relayId + "\"," 
-              + "\"rssi\":" + String(node.rssi) + "," 
-              + "\"snr\":" + String(node.snr, 2) + "," 
-              + "\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\"," 
-              + "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
-        firstIndirect = false;
-      }
+    for (auto const& entry : indirectNodes) {
+      if (!firstIndirect) json += ",";
+      const auto &node = entry.second;
+      json += "{\"originatorId\":\"" + node.originatorId + "\"," 
+            + "\"relayId\":\"" + node.relayId + "\"," 
+            + "\"rssi\":" + String(node.rssi) + "," 
+            + "\"snr\":" + String(node.snr, 2) + "," 
+            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\"," 
+            + "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
+      firstIndirect = false;
     }
     json += "]}";
     request->send(200, "application/json", json);
