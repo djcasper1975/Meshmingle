@@ -73,6 +73,7 @@ struct TransmissionStatus {
   bool relayedViaLoRa = false;     // NEW: whether the message has been relayed via LoRa
   bool queuedForLoRa = false;      // NEW: whether the message is already queued for LoRa transmission
   bool relayRetryAttempted = false; // NEW: whether a retry has already been attempted
+  bool pendingWiFiRelay = false;   // NEW: flag to indicate WiFi relay pending after LoRa finishes
   OriginChannel origin = ORIGIN_UNKNOWN; // NEW: track the origin (WiFi vs LoRa) of this message
   uint64_t timestamp = millis();   // record when the entry was created/updated
 };
@@ -756,10 +757,10 @@ void transmitWithDutyCycle(const String& message) {
 
     // After successful transmission, forward via WiFi if appropriate.
     if (!message.startsWith("HEARTBEAT|")) {
-      if (messageTransmissions[messageID].origin == ORIGIN_LORA) {
+      // If the message is pending a WiFi relay, relay it now.
+      if (messageTransmissions[messageID].pendingWiFiRelay) {
           transmitViaWiFi(message);
-      } else {
-          Serial.println("[LoRa Tx] Message originated via WiFi; skipping WiFi relay.");
+          messageTransmissions[messageID].pendingWiFiRelay = false;
       }
     }
 
@@ -2382,9 +2383,10 @@ void setupServerRoutes() {
     Serial.printf("[LoRa Tx] Adding message: %s\n", constructedMessage.c_str());
 
     messageTransmissions[messageID].origin = ORIGIN_WIFI;
+    // Mark that WiFi relay is pending – it will be transmitted after LoRa succeeds.
+    messageTransmissions[messageID].pendingWiFiRelay = true;
 
-    // Transmit via WiFi and schedule LoRa transmission as before
-    transmitViaWiFi(constructedMessage);
+    // Schedule LoRa transmission for the message.
     scheduleLoRaTransmission(constructedMessage);
     request->redirect("/");
   });
