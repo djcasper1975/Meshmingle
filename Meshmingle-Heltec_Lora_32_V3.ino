@@ -1,7 +1,7 @@
-//Test v1.00.026 
-//17-02-2025
+//Test v1.00.027 
+//18-02-2025
 //
-//YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!!!!!
+//YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //EU868 Band P (869.4 MHz - 869.65 MHz): 10%, 500 mW ERP (10% 24hr 8640 seconds = 6 mins per hour TX Time.)
@@ -13,6 +13,7 @@
 //important performance updates.
 //wifi was relaying way too much causing flag resets for lora relays when lora and wifi in range multiple nodes close.
 //added support for heltec v3.2
+//added tx log you can access by clicking your node id on mainpage.
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -21,7 +22,6 @@
 // M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
-
 
 #define RADIOLIB_SX1262
 #define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
@@ -422,7 +422,57 @@ void addMessage(const String& nodeId, const String& messageID, const String& sen
                 finalSource.c_str(), messageID.c_str(), relayID.c_str());
 }
 
-//
+// --- TX History Logging ---
+// NEW: Structure and global vector to store TX history.
+struct TxHistoryEntry {
+  uint64_t timestamp;
+  String type; // Emoji: "❤️" for heartbeat, "📡" for agg heartbeat, "⌨️" for our message, "🛰️" for relayed, "💬" for private message
+  uint64_t txTime; // in ms
+  bool success;
+};
+
+std::vector<TxHistoryEntry> txHistory;
+
+// --- Helper: Determine TX type from message ---
+String determineTxType(const String &message) {
+  // Check for heartbeat types first.
+  if (message.startsWith("AGG_HEARTBEAT|")) {
+    return "📡";
+  } else if (message.startsWith("HEARTBEAT|")) {
+    return "❤️";
+  } else {
+    // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
+    int pos1 = message.indexOf('|');
+    int pos2 = message.indexOf('|', pos1 + 1);
+    int pos3 = message.indexOf('|', pos2 + 1);
+    int pos4 = message.indexOf('|', pos3 + 1);
+    if (pos1 == -1 || pos2 == -1 || pos3 == -1 || pos4 == -1) {
+      return "❓";
+    }
+    String originatorID = message.substring(pos1 + 1, pos2);
+    String recipient = message.substring(pos3 + 1, pos4);
+    String myId = getCustomNodeId(getNodeId());
+    bool isPrivate = (recipient != "ALL");
+    if (isPrivate) {
+      if (originatorID == myId) {
+        // Private message sent by me.
+        return "⌨️💬";
+      } else {
+        // Relayed private message.
+        return "🛰️💬";
+      }
+    } else {
+      // Public message.
+      if (originatorID == myId) {
+        return "⌨️";
+      } else {
+        return "🛰️";
+      }
+    }
+  }
+}
+
+
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
 // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
 void scheduleLoRaTransmission(String message) {
@@ -726,6 +776,12 @@ void transmitWithDutyCycle(const String& message) {
   tx_time = millis() - tx_time;
   heltec_led(0);
 
+  // Log the TX attempt:
+  TxHistoryEntry txEntry;
+  txEntry.timestamp = millis();
+  txEntry.type = determineTxType(message);
+  txEntry.txTime = tx_time;
+
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
     // Mark as successfully transmitted via LoRa.
@@ -738,9 +794,6 @@ void transmitWithDutyCycle(const String& message) {
     calculateDutyCyclePause(tx_time);
     last_tx = millis();
     drawMainScreen(tx_time);
-    
-    // OPTIONAL: If needed, insert a short delay here.
-    // delay(50);
     
     radio.startReceive();
     
@@ -760,7 +813,7 @@ void transmitWithDutyCycle(const String& message) {
     // Since our node relayed successfully, remove the relay log for this message.
     relayLog.erase(messageID);
     
-    // The message is now fully relayed on LoRa.
+    txEntry.success = true;
   } else {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
     // If a retry has not yet been attempted, schedule one more attempt.
@@ -778,13 +831,17 @@ void transmitWithDutyCycle(const String& message) {
         Serial.printf("[LoRa Tx] Removing top queued entry for message %s after retry failure\n", messageID.c_str());
       }
     }
+    txEntry.success = false;
+  }
+  txHistory.push_back(txEntry);
+  if(txHistory.size() > 100) {
+    txHistory.erase(txHistory.begin());
   }
 }
 
 // ----------------------------
 // NEW: Heartbeat scheduling with random jitter
 // ----------------------------
-// (The following constants are defined as follows:)
 const unsigned long firstHeartbeatDelayValue = 20000; // 20 seconds for first heartbeat
 const unsigned long heartbeatIntervalValue = 900000;    // 15 minutes for subsequent heartbeats
 // aggregatedHeartbeatInterval is defined above.
@@ -799,13 +856,11 @@ void sendHeartbeat() {
   sprintf(crcStr, "%04X", crc);
   String heartbeatMessage = heartbeatWithoutCRC + "|" + String(crcStr);
 
-  // Check if duty cycle restrictions allow transmission.
   if (!isDutyCycleAllowed()) {
     Serial.println("[Heartbeat Tx] Duty cycle limit reached, skipping.");
     return;
   }
 
-  // Check if the radio is busy (similar to queued messages)
   if (radio.available()) {
     Serial.println("[Heartbeat Tx] Radio is busy receiving a packet. Delaying heartbeat by 500ms.");
     return;
@@ -817,6 +872,17 @@ void sendHeartbeat() {
   int transmitStatus = radio.transmit(heartbeatMessage.c_str());
   uint64_t txTime = millis() - txStart;
   heltec_led(0);
+
+    // Log TX history for heartbeat
+  {
+    TxHistoryEntry entry;
+    entry.timestamp = millis();
+    entry.type = "❤️"; // Heartbeat emoji
+    entry.txTime = txTime;
+    entry.success = (transmitStatus == RADIOLIB_ERR_NONE);
+    txHistory.push_back(entry);
+    if (txHistory.size() > 100) txHistory.erase(txHistory.begin());
+  }
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[Heartbeat Tx] Sent successfully (%llu ms)\n", txTime);
@@ -867,6 +933,17 @@ void sendAggregatedHeartbeat() {
   int transmitStatus = radio.transmit(aggMessage.c_str());
   uint64_t txTime = millis() - txStart;
   heltec_led(0);
+
+    // Log TX history for aggregated heartbeat
+  {
+    TxHistoryEntry entry;
+    entry.timestamp = millis();
+    entry.type = "📡"; // Aggregated heartbeat emoji
+    entry.txTime = txTime;
+    entry.success = (transmitStatus == RADIOLIB_ERR_NONE);
+    txHistory.push_back(entry);
+    if (txHistory.size() > 100) txHistory.erase(txHistory.begin());
+  }
   
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[Aggregated Heartbeat Tx] Sent successfully (%llu ms)\n", txTime);
@@ -892,11 +969,11 @@ void setup() {
   heltec_setup();
   Serial.println("Initializing LoRa radio...");
   heltec_led(0);
-  pinMode(Vext, OUTPUT);   
-  digitalWrite(Vext, LOW);  
-  delay(100);  
+  pinMode(Vext, OUTPUT);   //heltec v3.2 fix
+  digitalWrite(Vext, LOW);  //heltec v3.2 fix
+  delay(100);  //heltec v3.2 fix
   display.init();
-  display.setContrast(255);
+  display.setContrast(255); //heltec v3.2 fix
   display.flipScreenVertically();
   display.clear();
   display.setFont(ArialMT_Plain_10);
@@ -955,6 +1032,7 @@ void setup() {
   global_jitter_offset = chip_offset % 10000;
   nextHeartbeatTime = millis() + firstHeartbeatDelayValue + global_jitter_offset;
   nextAggregatedHeartbeatTime = millis() + aggregatedHeartbeatInterval + global_jitter_offset;
+
 }
 
 void loop() {
@@ -1039,13 +1117,34 @@ void loop() {
           }
           else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
             Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
-            // Extract the sender of the aggregated heartbeat (the node that transmitted it)
             int firstSep = messageWithoutCRC.indexOf('|');
             if (firstSep == -1) {
               Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
             } else {
+              // Extract sender's relay ID
               String senderRelayId = messageWithoutCRC.substring(firstSep + 1, messageWithoutCRC.indexOf('|', firstSep + 1));
-              // Now process the remaining fields as direct neighbors of senderRelayId
+              
+              // Update or add the sender's node in loraNodes using the aggregated heartbeat emoji 📡
+              if (senderRelayId != getCustomNodeId(getNodeId())) {
+                LoRaNode &node = loraNodes[senderRelayId];
+                node.nodeId = senderRelayId;
+                int rssi = radio.getRSSI();
+                float snr = radio.getSNR();
+                uint64_t currentTime = millis();
+                node.lastRSSI = rssi;
+                node.lastSNR = snr;
+                node.lastSeen = currentTime;
+                
+                NodeMetricsSample sample = { currentTime, rssi, snr };
+                node.history.push_back(sample);
+                if (node.history.size() > 60) {
+                  node.history.erase(node.history.begin());
+                }
+                node.statusEmoji = "📡";  // Use aggregated heartbeat emoji
+                Serial.printf("[LoRa Nodes] Updated/Added node: %s (Aggregated Heartbeat)\n", senderRelayId.c_str());
+              }
+              
+              // Process the aggregated heartbeat neighbors for indirect nodes
               int startPos = messageWithoutCRC.indexOf('|', firstSep + 1) + 1;
               while (true) {
                 int nextSep = messageWithoutCRC.indexOf('|', startPos);
@@ -1057,19 +1156,15 @@ void loop() {
                 }
                 
                 if (neighborId.length() > 0 && neighborId != getCustomNodeId(getNodeId())) {
-                  // Here, update your 1-hop (indirect) node list
                   uint64_t currentTime = millis();
                   int rssi = radio.getRSSI();
                   float snr = radio.getSNR();
-                  
-                  // Use a composite key to store these nodes
                   String key = neighborId + "-" + senderRelayId;
                   auto it = indirectNodes.find(key);
                   if (it != indirectNodes.end()) {
                     it->second.lastSeen = currentTime;
                     it->second.rssi = rssi;
                     it->second.snr = snr;
-                    // Optionally update history if needed
                   } else {
                     IndirectNode indNode;
                     indNode.originatorId = neighborId;
@@ -1670,8 +1765,8 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
       .then(response => response.json())
       .then(data => {
         localStorage.setItem('nodeId', data.nodeId);
-        document.getElementById('deviceCount').innerHTML =
-          `Mesh Nodes: <a href="/nodes">${data.totalCount}</a>, Node ID: ${data.nodeId}`;
+         document.getElementById('deviceCount').innerHTML =
+          `Mesh Nodes: <a href="/nodes">${data.totalCount}</a>, Node ID: <a href="/txHistory">${data.nodeId}</a>`;
       })
       .catch(error => console.error('Error fetching device count:', error));
   }
@@ -2208,6 +2303,95 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+const char txHistoryPageHtml[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TX History</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f4f7f6;
+      margin: 0;
+      padding: 20px;
+    }
+    h2 {
+      text-align: center;
+      color: #333;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 20px auto;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 8px;
+      text-align: left;
+      font-size: 0.9em;
+    }
+    th {
+      background-color: #eee;
+    }
+    .nav-links {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .nav-links a {
+      margin: 0 15px;
+      text-decoration: none;
+      color: #007bff;
+      font-weight: bold;
+    }
+    .nav-links a:hover {
+      text-decoration: underline;
+    }
+  </style>
+  <script>
+    function fetchTxHistory() {
+      fetch('/txHistoryData')
+        .then(response => response.json())
+        .then(data => {
+          const container = document.getElementById('historyContainer');
+          container.innerHTML = '';
+          if (data.txHistory.length === 0) {
+            container.innerHTML = '<p>No TX history available.</p>';
+            return;
+          }
+          let html = '<table><thead><tr><th>Timestamp</th><th>Type</th><th>TX Time (ms)</th><th>Status</th></tr></thead><tbody>';
+          data.txHistory.forEach(entry => {
+            html += '<tr>';
+            html += '<td>' + entry.timestamp + '</td>';
+            html += '<td>' + entry.type + '</td>';
+            html += '<td>' + entry.txTime + '</td>';
+            html += '<td>' + (entry.success ? '✅' : '❌') + '</td>';
+            html += '</tr>';
+          });
+          html += '</tbody></table>';
+          container.innerHTML = html;
+        })
+        .catch(error => {
+          console.error('Error fetching TX history:', error);
+        });
+    }
+    window.onload = function() {
+      fetchTxHistory();
+      setInterval(fetchTxHistory, 5000);
+    };
+  </script>
+</head>
+<body>
+  <div class="nav-links">
+    <a href="/">Chat</a> | <a href="/nodes">Nodes</a> | <a href="/metrics">History</a>
+  </div>
+  <h2>TX History</h2>
+  <div id="historyContainer"></div>
+</body>
+</html>
+)rawliteral";
+
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
   uint64_t ageSec = ageMs / 1000;
@@ -2271,29 +2455,41 @@ void setupServerRoutes() {
     request->send(200, "text/html", nodesPageHtml);
   });
 
-  server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String json = "{\"messages\":[";
-    bool first = true;
-    for (const auto& msg : messages) {
-      if (!first) json += ",";
-      json += "{\"nodeId\":\"" + msg.nodeId + "\",\"sender\":\"" + msg.sender + "\",\"recipient\":\"" + msg.recipient + "\",\"content\":\"" + msg.content + "\",\"source\":\"" + msg.source + "\",\"messageID\":\"" + msg.messageID + "\",\"relayID\":\"" + msg.relayID + "\",\"timeReceived\":" + String(msg.timeReceived);
-      if (msg.source == "[LoRa]") {
-        json += ",\"rssi\":" + String(msg.rssi) + ",\"snr\":" + String(msg.snr, 2);
-      }
-      // NEW: output the relayIDs vector as an array
-      json += ",\"relayIDs\":[";
-      bool firstRelay = true;
-      for (auto &rid : msg.relayIDs) {
-        if (!firstRelay) json += ",";
-        json += "\"" + rid + "\"";
-        firstRelay = false;
-      }
-      json += "]}";
-      first = false;
+server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
+  String json = "{\"messages\":[";
+  bool first = true;
+  for (const auto& msg : messages) {
+    if (!first) json += ",";
+    // Reconstruct the original message string (without CRC) for the helper function.
+    String fullMsg = msg.messageID + "|" + msg.nodeId + "|" + msg.sender + "|" + msg.recipient + "|" + msg.content + "|" + msg.relayID;
+    String emoji = determineTxType(fullMsg);
+    json += "{\"nodeId\":\"" + msg.nodeId + "\",";
+    json += "\"sender\":\"" + msg.sender + "\",";
+    json += "\"recipient\":\"" + msg.recipient + "\",";
+    json += "\"content\":\"" + msg.content + "\",";
+    json += "\"source\":\"" + msg.source + "\",";
+    json += "\"messageID\":\"" + msg.messageID + "\",";
+    json += "\"relayID\":\"" + msg.relayID + "\",";
+    json += "\"timeReceived\":" + String(msg.timeReceived) + ",";
+    json += "\"emoji\":\"" + emoji + "\"";
+    if (msg.source == "[LoRa]") {
+      json += ",\"rssi\":" + String(msg.rssi) + ",\"snr\":" + String(msg.snr, 2);
     }
-    json += "], \"currentDeviceTime\":" + String(millis()) + "}";
-    request->send(200, "application/json", json);
-  });
+    // Output relayIDs vector as an array.
+    json += ",\"relayIDs\":[";
+    bool firstRelay = true;
+    for (auto &rid : msg.relayIDs) {
+      if (!firstRelay) json += ",";
+      json += "\"" + rid + "\"";
+      firstRelay = false;
+    }
+    json += "]}";
+    first = false;
+  }
+  json += "], \"currentDeviceTime\":" + String(millis()) + "}";
+  request->send(200, "application/json", json);
+});
+
 
   // --- UPDATED: Use totalNodeCount (mesh nodes only) for deviceCount ---
   server.on("/deviceCount", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -2462,6 +2658,30 @@ void setupServerRoutes() {
     json += "]}";
     request->send(200, "application/json", json);
   });
+
+  // New endpoint to serve the TX History page
+  server.on("/txHistory", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", txHistoryPageHtml);
+  });
+
+  // New endpoint to serve the TX History JSON data
+server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
+  String json = "{\"txHistory\":[";
+  bool first = true;
+  uint64_t now = millis();
+  for (int i = txHistory.size()-1; i >= 0; i--) {
+    if (!first) json += ",";
+    // Format timestamp as relative time (e.g., "5 sec ago")
+    String formattedTime = formatRelativeTime(now - txHistory[i].timestamp);
+    json += "{\"timestamp\":\"" + formattedTime + "\",";
+    json += "\"type\":\"" + txHistory[i].type + "\",";
+    json += "\"txTime\":" + String(txHistory[i].txTime) + ",";
+    json += "\"success\":" + String(txHistory[i].success ? "true" : "false") + "}";
+    first = false;
+  }
+  json += "]}";
+  request->send(200, "application/json", json);
+});
 
   server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("nodeId")) {
