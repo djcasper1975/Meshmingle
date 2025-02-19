@@ -1,5 +1,5 @@
-//Test v1.00.027 
-//18-02-2025
+//Test v1.00.028 
+//19-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -14,6 +14,8 @@
 //wifi was relaying way too much causing flag resets for lora relays when lora and wifi in range multiple nodes close.
 //added support for heltec v3.2
 //added tx log you can access by clicking your node id on mainpage.
+//you can now choese v3 or v3.2 board instead of compatability for both
+//altered relay logic again.
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -22,7 +24,15 @@
 // M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
-
+//
+// Uncomment the line below to enable Heltec V3.2 specific code.
+//
+//#define HELTEC_V3_2
+//
+// If not defined, we assume Heltec V3.
+#ifndef HELTEC_V3_2
+#endif
+//
 #define RADIOLIB_SX1262
 #define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
 #include <heltec_unofficial.h> // Heltec library for OLED and LoRa
@@ -49,6 +59,7 @@
 #define SPREADING_FACTOR 11 
 #define TRANSMIT_POWER 22 //This is max power for This Boards EU868 Config.
 #define CODING_RATE 8 
+
 
 // Some Global Variables
 bool enableRxBoost = true; //enable or disable RX Boost Mode
@@ -482,17 +493,17 @@ void scheduleLoRaTransmission(String message) {
         return;
     }
 
+    // Extract and validate the CRC.
     String crcStr = message.substring(lastSeparator + 1);
     String messageWithoutCRC = message.substring(0, lastSeparator);
-
     uint16_t receivedCRC = (uint16_t)strtol(crcStr.c_str(), NULL, 16);
     uint16_t computedCRC = crc16_ccitt((const uint8_t *)messageWithoutCRC.c_str(), messageWithoutCRC.length());
-
     if (receivedCRC != computedCRC) {
         Serial.printf("[LoRa Schedule] CRC mismatch. Received: %04X, Computed: %04X\n", receivedCRC, computedCRC);
         return;
     }
 
+    // Parse the message fields.
     int firstSeparator = messageWithoutCRC.indexOf('|');
     int secondSeparator = messageWithoutCRC.indexOf('|', firstSeparator + 1);
     int thirdSeparator = messageWithoutCRC.indexOf('|', secondSeparator + 1);
@@ -513,43 +524,40 @@ void scheduleLoRaTransmission(String message) {
     String relayID = messageWithoutCRC.substring(fifthSeparator + 1);
 
     String myId = getCustomNodeId(getNodeId());
-    // Do not relay private messages that have reached their recipient.
+
+    // If this is a private message that has reached its recipient, don't relay.
     if (recipientID != "ALL" && myId == recipientID) {
         Serial.println("[LoRa Schedule] Private message reached its recipient. Not scheduling retransmission.");
         return;
     }
 
-    auto& status = messageTransmissions[messageID];
+    auto &status = messageTransmissions[messageID];
     if (status.queuedForLoRa) {
-      Serial.println("[LoRa Schedule] Message already queued for LoRa, skipping...");
-      return;
+        Serial.println("[LoRa Schedule] Message already queued for LoRa, skipping...");
+        return;
     }
 
-    // [MODIFIED]:
-    // If the message is from a remote node (relayID != myId),
-    // use a deterministic extra delay selected from 10 discrete slots.
-    if (relayID != myId) {
+    // Check if the message is originating from our own node.
+    bool isOwnMessage = (originatorID == myId);
+
+    if (!isOwnMessage) {
+        // For relayed messages: update relayID to our own.
         String newRelayID = myId;
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
         loraTransmissionQueue.push_back(updatedMessage);
         status.queuedForLoRa = true;
-        if (loraTransmissionQueue.size() == 1) {
-            const unsigned long delayOptions[10] = {3500, 7000, 10500, 14000, 17500, 21000, 24500, 28000, 31500, 35000};
-            int slot = (ESP.getEfuseMac() & 0xFFFF) % 10;
-            unsigned long extraDelay = delayOptions[slot];
-            loRaTransmitDelay = millis() + extraDelay;
-        }
-        Serial.printf("[LoRa Schedule] Scheduled relay from %s after %lu ms: %s\n",
-                      newRelayID.c_str(), loRaTransmitDelay - millis(), updatedMessage.c_str());
+        // Pick a random delay between 3 and 25 seconds.
+        unsigned long extraDelaySeconds = random(3, 26); // returns 3...25 inclusive.
+        loRaTransmitDelay = millis() + (extraDelaySeconds * 1000UL);
+        Serial.printf("[LoRa Schedule] Scheduled relay with random delay of %lu seconds: %s\n",
+                      extraDelaySeconds, updatedMessage.c_str());
     } else {
-        // For an original message from this node, use the global jitter offset only.
+        // For our own original message, use a fixed 2-second delay.
         loraTransmissionQueue.push_back(message);
         status.queuedForLoRa = true;
-        if (loraTransmissionQueue.size() == 1) {
-            loRaTransmitDelay = millis() + global_jitter_offset;
-        }
-        Serial.printf("[LoRa Schedule] Scheduled original message with delay %lu ms: %s\n",
-                      loRaTransmitDelay - millis(), message.c_str());
+        loRaTransmitDelay = millis() + 2000;
+        Serial.printf("[LoRa Schedule] Scheduled original message with fixed 2-second delay: %s\n",
+                      message.c_str());
     }
 }
 
@@ -819,7 +827,7 @@ void transmitWithDutyCycle(const String& message) {
     // If a retry has not yet been attempted, schedule one more attempt.
     if (!messageTransmissions[messageID].relayRetryAttempted) {
       messageTransmissions[messageID].relayRetryAttempted = true;
-      unsigned long extraDelay = random(3000, 13000); // random delay between 3000ms and 13000ms
+      unsigned long extraDelay = random(3000, 21000); // random delay between 3000ms and 13000ms
       loRaTransmitDelay = millis() + global_jitter_offset + extraDelay;
       Serial.printf("[LoRa Tx] Scheduling a retry for message %s in %lu ms\n", messageID.c_str(), loRaTransmitDelay - millis());
       // Do not remove the queued entry so that it gets retried.
@@ -969,11 +977,17 @@ void setup() {
   heltec_setup();
   Serial.println("Initializing LoRa radio...");
   heltec_led(0);
-  pinMode(Vext, OUTPUT);   //heltec v3.2 fix
-  digitalWrite(Vext, LOW);  //heltec v3.2 fix
-  delay(100);  //heltec v3.2 fix
+  #ifdef HELTEC_V3_2
+    // Heltec V3.2 specific initialization:
+    pinMode(Vext, OUTPUT);    // heltec v3.2 fix
+    digitalWrite(Vext, LOW);  // heltec v3.2 fix
+    delay(100);               // heltec v3.2 fix
+  #endif
   display.init();
+  #ifdef HELTEC_V3_2
+    // Heltec V3.2 specific initialization:
   display.setContrast(255); //heltec v3.2 fix
+  #endif
   display.flipScreenVertically();
   display.clear();
   display.setFont(ArialMT_Plain_10);
@@ -1023,9 +1037,10 @@ void setup() {
   // ---------------------------
   // IMPROVED RANDOM SEED USING CHIP ID
   // ---------------------------
-  uint64_t chipid = ESP.getEfuseMac();
-  randomSeed((uint32_t)(chipid >> 32) ^ (uint32_t)chipid);
-  Serial.printf("Random seed set using chip ID: 0x%08X\n", (uint32_t)(chipid ^ (chipid >> 32)));
+uint64_t chipid = ESP.getEfuseMac(); // This returns the full 48-bit MAC address.
+uint32_t seed = (uint32_t)(chipid & 0xFFFFFFFF) ^ (uint32_t)(chipid >> 16);
+randomSeed(seed);
+Serial.printf("Random seed set using improved chip ID: 0x%08X\n", seed);
 
   // Derive a global jitter offset based on the unique chip ID and use it for all transmissions
   uint32_t chip_offset = (uint32_t)(ESP.getEfuseMac() & 0xFFFF);
