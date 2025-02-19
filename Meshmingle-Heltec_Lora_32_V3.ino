@@ -25,7 +25,7 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-// Uncomment the line below to enable Heltec V3.2 specific code.
+// Uncomment the define line below to enable Heltec V3.2 specific code.
 //
 //#define HELTEC_V3_2
 //
