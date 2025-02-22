@@ -1,5 +1,5 @@
-//Test v1.00.028 
-//19-02-2025
+//Test v1.00.029 
+//22-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -16,6 +16,8 @@
 //added tx log you can access by clicking your node id on mainpage.
 //you can now choese v3 or v3.2 board instead of compatability for both
 //altered relay logic again.
+//wifi does not keep relaying the same message when recived through wifi asnd varous lora relays.
+//Now also introducing a dynamic slot system for relayed messages that uses the measured RX RSSI from the message being relayed.
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -25,9 +27,9 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-// Uncomment the define line below to enable Heltec V3.2 specific code.
+// Uncomment the line below to enable Heltec V3.2 specific code.
 //
-//#define HELTEC_V3_2
+#define HELTEC_V3_2
 //
 // If not defined, we assume Heltec V3.
 #ifndef HELTEC_V3_2
@@ -35,8 +37,8 @@
 //
 #define RADIOLIB_SX1262
 #define HELTEC_POWER_BUTTON // Use the power button feature of Heltec
-#include <heltec_unofficial.h> // Heltec library for OLED and LoRa
-#include <painlessMesh.h>
+#include <heltec_unofficial.h> // 0.9.2 Heltec library for OLED and LoRa
+#include <painlessMesh.h>  //1.5.4
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
@@ -44,7 +46,7 @@
 #include <esp_task_wdt.h> // Watchdog timer library
 #include <vector>         // For handling list of messages and our queue
 #include <map>            // For unified retransmission tracking
-#include <RadioLib.h>
+#include <RadioLib.h>     //7.1.2
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
 
 // Meshmingle Parameters
@@ -196,6 +198,8 @@ unsigned long messageCounter = 0;
 // Global jitter offset (derived from chip ID) used for all random delays
 uint32_t global_jitter_offset = 0;
 
+// New global: (we no longer solely rely on global lastRxRSSI for relayed messages)
+  
 // Returns a custom formatted node id, for example: "!Mxxxxxx"
 String getCustomNodeId(uint32_t nodeId) {
     String hexNodeId = String(nodeId, HEX);
@@ -347,6 +351,23 @@ void cleanupTransmissionHistory() {
   }
 }
 
+// --- Helper functions for dynamic slot calculation ---
+// getTxDuration: returns the measured TX duration in ms; if not available, returns preset 3000 ms.
+unsigned long getTxDuration(String message) {
+  // For now, we simply return 3000. (You can modify this function to compute based on message length.)
+  return 3000;
+}
+
+// getDynamicSlot: computes the slot duration as baseSlot plus an offset derived from RSSI.
+// Here we map RSSI (from -120 to -50) to an offset from 0 to 500 ms.
+unsigned long getDynamicSlot(unsigned long baseSlot, int rssi) {
+  if (baseSlot == 0) baseSlot = 3000; // default if not available
+  if (rssi < -180) rssi = -180;
+  if (rssi > -15) rssi = -15;
+  int rssiOffset = map(rssi, -180, -15, 0, 4000);
+  return baseSlot + rssiOffset;
+}
+
 // --- UPDATED addMessage() to accept the recipient and only add private messages if intended ---
 // Also, for messages originating from our node, update the relay info and store each unique relayID.
 void addMessage(const String& nodeId, const String& messageID, const String& sender, 
@@ -446,13 +467,11 @@ std::vector<TxHistoryEntry> txHistory;
 
 // --- Helper: Determine TX type from message ---
 String determineTxType(const String &message) {
-  // Check for heartbeat types first.
   if (message.startsWith("AGG_HEARTBEAT|")) {
     return "📡";
   } else if (message.startsWith("HEARTBEAT|")) {
     return "❤️";
   } else {
-    // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
     int pos1 = message.indexOf('|');
     int pos2 = message.indexOf('|', pos1 + 1);
     int pos3 = message.indexOf('|', pos2 + 1);
@@ -466,14 +485,11 @@ String determineTxType(const String &message) {
     bool isPrivate = (recipient != "ALL");
     if (isPrivate) {
       if (originatorID == myId) {
-        // Private message sent by me.
         return "⌨️💬";
       } else {
-        // Relayed private message.
         return "🛰️💬";
       }
     } else {
-      // Public message.
       if (originatorID == myId) {
         return "⌨️";
       } else {
@@ -486,7 +502,8 @@ String determineTxType(const String &message) {
 
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
 // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
-void scheduleLoRaTransmission(String message) {
+// Modified to take an additional parameter measuredRssi (default -100) so that for relayed messages we can use the measured RX RSSI.
+void scheduleLoRaTransmission(String message, int measuredRssi = -100) {
     int lastSeparator = message.lastIndexOf('|');
     if (lastSeparator == -1) {
         Serial.println("[LoRa Schedule] Invalid format (no CRC).");
@@ -541,18 +558,22 @@ void scheduleLoRaTransmission(String message) {
     bool isOwnMessage = (originatorID == myId);
 
     if (!isOwnMessage) {
-        // For relayed messages: update relayID to our own.
         String newRelayID = myId;
         String updatedMessage = constructMessage(messageID, originatorID, senderID, recipientID, messageContent, newRelayID);
         loraTransmissionQueue.push_back(updatedMessage);
         status.queuedForLoRa = true;
-        // Pick a random delay between 3 and 25 seconds.
-        unsigned long extraDelaySeconds = random(3, 26); // returns 3...25 inclusive.
-        loRaTransmitDelay = millis() + (extraDelaySeconds * 1000UL);
-        Serial.printf("[LoRa Schedule] Scheduled relay with random delay of %lu seconds: %s\n",
-                      extraDelaySeconds, updatedMessage.c_str());
+        // Calculate dynamic slot:
+        unsigned long baseSlot = getTxDuration(message); // default returns 3000 ms
+        unsigned long dynamicSlot = getDynamicSlot(baseSlot, measuredRssi);
+        unsigned long totalWindow = 35000; // 35 seconds total window
+        int numSlots = totalWindow / dynamicSlot;
+        if(numSlots < 1) numSlots = 1;
+        int randomSlot = random(1, numSlots + 1);
+        loRaTransmitDelay = millis() + (randomSlot * dynamicSlot);
+        Serial.printf("[LoRa Schedule] Scheduled relay with dynamic slot: baseSlot=%lu, dynamicSlot=%lu, randomSlot=%d, delay=%lu ms: %s\n",
+                      baseSlot, dynamicSlot, randomSlot, randomSlot * dynamicSlot, updatedMessage.c_str());
     } else {
-        // For our own original message, use a fixed 2-second delay.
+        // For our own original message, keep the fixed 2-second delay.
         loraTransmissionQueue.push_back(message);
         status.queuedForLoRa = true;
         loRaTransmitDelay = millis() + 2000;
@@ -668,7 +689,6 @@ void drawMainScreen(long txTimeMillis = -1) {
   display.drawString((128 - titleWidth) / 2, 0, "Meshmingle 1.0");
   display.drawString(0, 13, "Node ID: " + getCustomNodeId(getNodeId()));
 
-  // Count active direct LoRa nodes only (15min timeout)
   uint64_t currentTime = millis();
   int activeDirectLoRaNodes = 0;
   const uint64_t DIRECT_TIMEOUT = 900000; // 15 minutes
@@ -677,9 +697,8 @@ void drawMainScreen(long txTimeMillis = -1) {
       activeDirectLoRaNodes++;
     }
   }
-  int totalActiveLoRaNodes = activeDirectLoRaNodes;  // Only direct LoRa nodes are counted
-  
-  int wifiCount = totalNodeCount;  // totalNodeCount is updated in updateMeshData()
+  int totalActiveLoRaNodes = activeDirectLoRaNodes;  
+  int wifiCount = totalNodeCount;
 
   String combinedNodes = "WiFi Nodes: " + String(wifiCount) + "  LoRa: " + String(totalActiveLoRaNodes);
   int16_t combinedWidth = display.getStringWidth(combinedNodes);
@@ -708,7 +727,6 @@ void displayCarousel() {
   if (currentMillis - lastCarouselChange >= carouselInterval) {
     lastCarouselChange = currentMillis;
 
-    // Filter messages: Only show private messages for this node
     String myId = getCustomNodeId(getNodeId());
     std::vector<Message> filteredMessages;
     
@@ -719,10 +737,8 @@ void displayCarousel() {
     }
 
     if (filteredMessages.empty()) {
-      // No private messages for this node, reset carousel to main screen
       carouselIndex = 0;
     } else {
-      // Loop through filtered messages
       carouselIndex++;
       if (carouselIndex > (int)filteredMessages.size()) {
         carouselIndex = 0;
@@ -754,21 +770,17 @@ void displayCarousel() {
 long lastTxTimeMillisVar = -1;
 
 void transmitWithDutyCycle(const String& message) {
-  // **** NEW DUTY CYCLE CHECK FOR ALL LORA TRANSMISSIONS ****
   if (!isDutyCycleAllowed()) {
     Serial.printf("[LoRa Tx] Duty cycle active. Delaying transmission for %llu ms.\n", minimum_pause);
     loRaTransmitDelay = millis() + minimum_pause;
     return;
   }
-  // *********************************************************
 
-  // Ensure that the scheduled LoRa delay has expired.
   if (millis() < loRaTransmitDelay) {
     Serial.println("[LoRa Tx] LoRa delay not expired, waiting...");
     return;
   }
 
-  // Extract the messageID from the message (assumes message format is valid).
   int separatorIndex = message.indexOf('|');
   if (separatorIndex == -1) {
     Serial.println("[LoRa Tx] Invalid message format.");
@@ -776,7 +788,6 @@ void transmitWithDutyCycle(const String& message) {
   }
   String messageID = message.substring(0, separatorIndex);
   
-  // Record the transmission start time and transmit the message.
   tx_time = millis();
   Serial.printf("[LoRa Tx] Transmitting: %s\n", message.c_str());
   heltec_led(50);
@@ -784,7 +795,6 @@ void transmitWithDutyCycle(const String& message) {
   tx_time = millis() - tx_time;
   heltec_led(0);
 
-  // Log the TX attempt:
   TxHistoryEntry txEntry;
   txEntry.timestamp = millis();
   txEntry.type = determineTxType(message);
@@ -792,12 +802,9 @@ void transmitWithDutyCycle(const String& message) {
 
   if (transmitStatus == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa Tx] Sent successfully (%i ms)\n", (int)tx_time);
-    // Mark as successfully transmitted via LoRa.
     messageTransmissions[messageID].transmittedViaLoRa = true;
     messageTransmissions[messageID].relayedViaLoRa = true;
-    // Clear the queued flag so that future scheduling is possible.
     messageTransmissions[messageID].queuedForLoRa = false;
-    // Reset retry flag.
     messageTransmissions[messageID].relayRetryAttempted = false;
     calculateDutyCyclePause(tx_time);
     last_tx = millis();
@@ -806,33 +813,40 @@ void transmitWithDutyCycle(const String& message) {
     radio.startReceive();
     
     // Channel Isolation:
-    // After LoRa Tx, if a WiFi relay was pending, perform it and mark it so no further WiFi relay occurs.
-    if (messageTransmissions[messageID].pendingWiFiRelay) {
+    // After LoRa Tx, if a WiFi relay was pending and the message did not originate via WiFi, perform it.
+    if (messageTransmissions[messageID].pendingWiFiRelay && messageTransmissions[messageID].origin != ORIGIN_WIFI) {
       transmitViaWiFi(message);
       messageTransmissions[messageID].pendingWiFiRelay = false;
     }
     
-    // Remove only the top entry (the one just transmitted) from the relay queue.
     if (!loraTransmissionQueue.empty()) {
       loraTransmissionQueue.erase(loraTransmissionQueue.begin());
       Serial.printf("[LoRa Tx] Removed top queued entry for message %s\n", messageID.c_str());
     }
     
-    // Since our node relayed successfully, remove the relay log for this message.
     relayLog.erase(messageID);
     
     txEntry.success = true;
   } else {
     Serial.printf("[LoRa Tx] Transmission failed with error code: %i\n", transmitStatus);
-    // If a retry has not yet been attempted, schedule one more attempt.
     if (!messageTransmissions[messageID].relayRetryAttempted) {
       messageTransmissions[messageID].relayRetryAttempted = true;
-      unsigned long extraDelay = random(3000, 21000); // random delay between 3000ms and 13000ms
-      loRaTransmitDelay = millis() + global_jitter_offset + extraDelay;
-      Serial.printf("[LoRa Tx] Scheduling a retry for message %s in %lu ms\n", messageID.c_str(), loRaTransmitDelay - millis());
-      // Do not remove the queued entry so that it gets retried.
+      // Retry branch: if the message originated via our node, keep fixed 2-second delay; else, use dynamic slot delay.
+      if (messageTransmissions[messageID].origin == ORIGIN_WIFI) {
+          loRaTransmitDelay = millis() + 2000;
+          Serial.printf("[LoRa Tx] Scheduling a retry for own message %s with fixed 2-second delay\n", messageID.c_str());
+      } else {
+          unsigned long baseSlot = getTxDuration(message); // default 3000 ms if not available
+          unsigned long dynamicSlot = getDynamicSlot(baseSlot, -100); // For retry, if no new measurement, use default RSSI of -100
+          unsigned long totalWindow = 35000; // 35 seconds total window
+          int numSlots = totalWindow / dynamicSlot;
+          if(numSlots < 1) numSlots = 1;
+          int randomSlot = random(1, numSlots + 1);
+          loRaTransmitDelay = millis() + (randomSlot * dynamicSlot);
+          Serial.printf("[LoRa Tx] Scheduling a retry for message %s in %lu ms (dynamic slot, random slot %d)\n", 
+                        messageID.c_str(), loRaTransmitDelay - millis(), randomSlot);
+      }
     } else {
-      // Already retried once; clear the queued flag and remove the top entry.
       messageTransmissions[messageID].queuedForLoRa = false;
       if (!loraTransmissionQueue.empty()) {
         loraTransmissionQueue.erase(loraTransmissionQueue.begin());
@@ -852,8 +866,6 @@ void transmitWithDutyCycle(const String& message) {
 // ----------------------------
 const unsigned long firstHeartbeatDelayValue = 20000; // 20 seconds for first heartbeat
 const unsigned long heartbeatIntervalValue = 900000;    // 15 minutes for subsequent heartbeats
-// aggregatedHeartbeatInterval is defined above.
-
 unsigned long nextHeartbeatTime = 0;
 unsigned long nextAggregatedHeartbeatTime = 0;
 
@@ -881,11 +893,10 @@ void sendHeartbeat() {
   uint64_t txTime = millis() - txStart;
   heltec_led(0);
 
-    // Log TX history for heartbeat
   {
     TxHistoryEntry entry;
     entry.timestamp = millis();
-    entry.type = "❤️"; // Heartbeat emoji
+    entry.type = "❤️";
     entry.txTime = txTime;
     entry.success = (transmitStatus == RADIOLIB_ERR_NONE);
     txHistory.push_back(entry);
@@ -911,7 +922,6 @@ void sendAggregatedHeartbeat() {
   
   String aggMsgWithoutCRC = "AGG_HEARTBEAT|" + getCustomNodeId(getNodeId());
   
-  // New behavior: advertise only your direct mesh nodes (0-hop)
   auto directNodes = mesh.getNodeList();
   for (uint32_t node : directNodes) {
     String nodeIdStr = getCustomNodeId(node);
@@ -942,11 +952,10 @@ void sendAggregatedHeartbeat() {
   uint64_t txTime = millis() - txStart;
   heltec_led(0);
 
-    // Log TX history for aggregated heartbeat
   {
     TxHistoryEntry entry;
     entry.timestamp = millis();
-    entry.type = "📡"; // Aggregated heartbeat emoji
+    entry.type = "📡";
     entry.txTime = txTime;
     entry.success = (transmitStatus == RADIOLIB_ERR_NONE);
     txHistory.push_back(entry);
@@ -978,15 +987,13 @@ void setup() {
   Serial.println("Initializing LoRa radio...");
   heltec_led(0);
   #ifdef HELTEC_V3_2
-    // Heltec V3.2 specific initialization:
-    pinMode(Vext, OUTPUT);    // heltec v3.2 fix
-    digitalWrite(Vext, LOW);  // heltec v3.2 fix
-    delay(100);               // heltec v3.2 fix
+    pinMode(Vext, OUTPUT);
+    digitalWrite(Vext, LOW);
+    delay(100);
   #endif
   display.init();
   #ifdef HELTEC_V3_2
-    // Heltec V3.2 specific initialization:
-  display.setContrast(255); //heltec v3.2 fix
+  display.setContrast(255);
   #endif
   display.flipScreenVertically();
   display.clear();
@@ -998,9 +1005,9 @@ void setup() {
   RADIOLIB_OR_HALT(radio.begin());
   radio.setDio1Action(onRadioRx);
   if(enableRxBoost) {
-    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));  // Enable boosted RX mode
+    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));
   } else {
-    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(false)); // Disable boosted RX mode
+    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(false));
   }
   RADIOLIB_OR_HALT(radio.setFrequency(FREQUENCY));
   RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
@@ -1014,7 +1021,6 @@ void setup() {
   WiFi.softAP(MESH_SSID, MESH_PASSWORD);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
-  // Initialize mesh networking
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
   mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT);
   mesh.onReceive(receivedCallback);
@@ -1023,7 +1029,6 @@ void setup() {
   });
   mesh.setContainsRoot(false);
 
-  // Setup server routes
   setupServerRoutes();
   server.begin();
   dnsServer.start(53, "*", WiFi.softAPIP());
@@ -1034,20 +1039,15 @@ void setup() {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
 
-  // ---------------------------
-  // IMPROVED RANDOM SEED USING CHIP ID
-  // ---------------------------
-uint64_t chipid = ESP.getEfuseMac(); // This returns the full 48-bit MAC address.
-uint32_t seed = (uint32_t)(chipid & 0xFFFFFFFF) ^ (uint32_t)(chipid >> 16);
-randomSeed(seed);
-Serial.printf("Random seed set using improved chip ID: 0x%08X\n", seed);
+  uint64_t chipid = ESP.getEfuseMac();
+  uint32_t seed = (uint32_t)(chipid & 0xFFFFFFFF) ^ (uint32_t)(chipid >> 16);
+  randomSeed(seed);
+  Serial.printf("Random seed set using improved chip ID: 0x%08X\n", seed);
 
-  // Derive a global jitter offset based on the unique chip ID and use it for all transmissions
   uint32_t chip_offset = (uint32_t)(ESP.getEfuseMac() & 0xFFFF);
   global_jitter_offset = chip_offset % 10000;
   nextHeartbeatTime = millis() + firstHeartbeatDelayValue + global_jitter_offset;
   nextAggregatedHeartbeatTime = millis() + aggregatedHeartbeatInterval + global_jitter_offset;
-
 }
 
 void loop() {
@@ -1056,7 +1056,6 @@ void loop() {
 
   mesh.update();
 
-  // Process heartbeats using the new consistent jitter.
   if (millis() >= nextHeartbeatTime) {
     sendHeartbeat();
     nextHeartbeatTime = millis() + heartbeatIntervalValue + global_jitter_offset;
@@ -1088,7 +1087,6 @@ void loop() {
         } else {
           Serial.println("[LoRa Rx] CRC valid.");
 
-          // --- For messages other than heartbeat types, verify the prefix ---
           if (!messageWithoutCRC.startsWith("HEARTBEAT|") && !messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
             int firstSeparator = messageWithoutCRC.indexOf('|');
             if (firstSeparator == -1) {
@@ -1104,14 +1102,13 @@ void loop() {
             }
           }
 
-          // --- Heartbeat Handling ---
           if (messageWithoutCRC.startsWith("HEARTBEAT|")) {
             String senderNodeId = messageWithoutCRC.substring(strlen("HEARTBEAT|"));
             Serial.printf("[LoRa Rx] Heartbeat from %s\n", senderNodeId.c_str());
             int rssi = radio.getRSSI();
             float snr = radio.getSNR();
             uint64_t currentTime = millis();
-
+            // For heartbeat packets we update here (if needed)
             if (senderNodeId != getCustomNodeId(getNodeId())) {
               LoRaNode& node = loraNodes[senderNodeId];
               node.nodeId = senderNodeId;
@@ -1136,10 +1133,8 @@ void loop() {
             if (firstSep == -1) {
               Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
             } else {
-              // Extract sender's relay ID
               String senderRelayId = messageWithoutCRC.substring(firstSep + 1, messageWithoutCRC.indexOf('|', firstSep + 1));
               
-              // Update or add the sender's node in loraNodes using the aggregated heartbeat emoji 📡
               if (senderRelayId != getCustomNodeId(getNodeId())) {
                 LoRaNode &node = loraNodes[senderRelayId];
                 node.nodeId = senderRelayId;
@@ -1155,11 +1150,10 @@ void loop() {
                 if (node.history.size() > 60) {
                   node.history.erase(node.history.begin());
                 }
-                node.statusEmoji = "📡";  // Use aggregated heartbeat emoji
+                node.statusEmoji = "📡";
                 Serial.printf("[LoRa Nodes] Updated/Added node: %s (Aggregated Heartbeat)\n", senderRelayId.c_str());
               }
               
-              // Process the aggregated heartbeat neighbors for indirect nodes
               int startPos = messageWithoutCRC.indexOf('|', firstSep + 1) + 1;
               while (true) {
                 int nextSep = messageWithoutCRC.indexOf('|', startPos);
@@ -1187,7 +1181,7 @@ void loop() {
                     indNode.rssi = rssi;
                     indNode.snr = snr;
                     indNode.lastSeen = currentTime;
-                    indNode.statusEmoji = "🛰️";  // Mark as 1-hop from senderRelayId
+                    indNode.statusEmoji = "🛰️";
                     indirectNodes[key] = indNode;
                   }
                   Serial.printf("[Indirect Nodes] Updated 1-hop indirect node: Originator: %s, via Relay: %s, RSSI: %d, SNR: %.2f\n",
@@ -1200,7 +1194,6 @@ void loop() {
             }
           }
           else {
-            // For non-heartbeat messages, parse fields.
             int firstSeparator = messageWithoutCRC.indexOf('|');
             int secondSeparator = messageWithoutCRC.indexOf('|', firstSeparator + 1);
             int thirdSeparator = messageWithoutCRC.indexOf('|', secondSeparator + 1);
@@ -1235,7 +1228,8 @@ void loop() {
                   Serial.println("[LoRa Rx] Private message not for me, ignoring display.");
                 }
                 if (!status.queuedForLoRa && !status.relayedViaLoRa) {
-                  scheduleLoRaTransmission(message);
+                  // Pass the measured rssi from this message into scheduleLoRaTransmission
+                  scheduleLoRaTransmission(message, rssi);
                 }
                 uint64_t currentTime = millis();
 
@@ -1304,8 +1298,6 @@ void loop() {
                 }
               }
 
-              // --- NEW: Relay Log Update ---
-              // For non-heartbeat messages, log the relayID.
               bool alreadyLogged = false;
               if (relayLog.find(messageID) != relayLog.end()) {
                 for (auto &entry : relayLog[messageID]) {
@@ -1324,12 +1316,9 @@ void loop() {
                 Serial.printf("[Relay Log] Created new relay log for message %s with relay %s.\n", messageID.c_str(), relayID.c_str());
               }
               
-              // Channel Isolation:
-              // If our node has not yet relayed this message and there is a relay log entry,
-              // force a relay attempt.
               if (!status.relayedViaLoRa && !status.queuedForLoRa) {
                   Serial.printf("[Relay Log] Forcing relay attempt for message %s due to new relay log entry.\n", messageID.c_str());
-                  scheduleLoRaTransmission(message);
+                  scheduleLoRaTransmission(message, rssi);
               }
             }
           }
@@ -1436,10 +1425,13 @@ void receivedCallback(uint32_t from, String& message) {
   }
 
   auto &status = messageTransmissions[messageID];
+  // --- Added lines to mark WiFi origin ---
   status.origin = ORIGIN_WIFI;
+  status.transmittedViaWiFi = true;
 
   if (!status.queuedForLoRa && !status.relayedViaLoRa) {
-    scheduleLoRaTransmission(message);
+    // For WiFi messages, we call scheduleLoRaTransmission with default measured RSSI (-100)
+    scheduleLoRaTransmission(message, -100);
   }
 }
 
@@ -1588,18 +1580,15 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
       text-align: right;
       margin-top: 5px;
     }
-    /* Relay-status indicator for sent messages */
     .message.sent .relay-status {
       position: absolute;
       bottom: 2px;
       left: 2px;
       line-height: 1;
     }
-    /* Change only the circle's size to 0.75em */
     .message.sent .relay-status .circle {
       font-size: 0.75em;
     }
-    /* Satellite and keyboard icons remain at full (1em) size */
     .message.sent .relay-status .satellite,
     .message.sent .relay-status .keyboard {
       font-size: 1em;
@@ -1756,7 +1745,6 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
             <span class="message-time">${timestamp}</span>
             ${rssiSnrHtml}
           `;
-          // For messages sent by us, add a relay-status indicator in the bottom left.
           if (isSentByCurrentNode) {
             let indicator = "";
             if (msg.relayIDs && msg.relayIDs.length > 0) {
@@ -2475,7 +2463,6 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
   bool first = true;
   for (const auto& msg : messages) {
     if (!first) json += ",";
-    // Reconstruct the original message string (without CRC) for the helper function.
     String fullMsg = msg.messageID + "|" + msg.nodeId + "|" + msg.sender + "|" + msg.recipient + "|" + msg.content + "|" + msg.relayID;
     String emoji = determineTxType(fullMsg);
     json += "{\"nodeId\":\"" + msg.nodeId + "\",";
@@ -2490,7 +2477,6 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (msg.source == "[LoRa]") {
       json += ",\"rssi\":" + String(msg.rssi) + ",\"snr\":" + String(msg.snr, 2);
     }
-    // Output relayIDs vector as an array.
     json += ",\"relayIDs\":[";
     bool firstRelay = true;
     for (auto &rid : msg.relayIDs) {
@@ -2505,8 +2491,6 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
   request->send(200, "application/json", json);
 });
 
-
-  // --- UPDATED: Use totalNodeCount (mesh nodes only) for deviceCount ---
   server.on("/deviceCount", HTTP_GET, [](AsyncWebServerRequest* request) {
     updateMeshData();
     request->send(200, "application/json", "{\"totalCount\":" + String(totalNodeCount) + ", \"nodeId\":\"" + getCustomNodeId(getNodeId()) + "\"}");
@@ -2544,12 +2528,9 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     for (auto const& entry : indirectNodes) {
       if (!firstIndirect) json += ",";
       const auto &node = entry.second;
-      json += "{\"originatorId\":\"" + node.originatorId + "\"," 
-            + "\"relayId\":\"" + node.relayId + "\"," 
-            + "\"rssi\":" + String(node.rssi) + "," 
-            + "\"snr\":" + String(node.snr, 2) + "," 
-            + "\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\"," 
-            + "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
+      json += "{\"originatorId\":\"" + node.originatorId + "\",\"relayId\":\"" + node.relayId + "\","; 
+      json += "\"rssi\":" + String(node.rssi) + ",\"snr\":" + String(node.snr, 2) + ",\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\","; 
+      json += "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
       firstIndirect = false;
     }
     json += "]}";
@@ -2592,7 +2573,8 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     messageTransmissions[messageID].pendingWiFiRelay = true;
 
     // Schedule LoRa transmission for the message.
-    scheduleLoRaTransmission(constructedMessage);
+    // For WiFi, no measured rssi is available so we use the default (-100)
+    scheduleLoRaTransmission(constructedMessage, -100);
     request->redirect("/");
   });
 
@@ -2674,19 +2656,16 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "application/json", json);
   });
 
-  // New endpoint to serve the TX History page
   server.on("/txHistory", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send_P(200, "text/html", txHistoryPageHtml);
   });
 
-  // New endpoint to serve the TX History JSON data
 server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
   String json = "{\"txHistory\":[";
   bool first = true;
   uint64_t now = millis();
   for (int i = txHistory.size()-1; i >= 0; i--) {
     if (!first) json += ",";
-    // Format timestamp as relative time (e.g., "5 sec ago")
     String formattedTime = formatRelativeTime(now - txHistory[i].timestamp);
     json += "{\"timestamp\":\"" + formattedTime + "\",";
     json += "\"type\":\"" + txHistory[i].type + "\",";
@@ -2761,7 +2740,6 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
         ".section-title { font-weight:bold; font-size:1.1em; margin-top:20px; }"
         ".message-block { border:1px solid #ccc; margin:5px 0; padding:8px; border-radius:4px; }"
         ".message-block h4 { margin:0; font-size:0.9em; }"
-        "/* Force text wrapping for long content */"
         ".message-block p { margin:4px 0; font-size:0.85em; white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
         ".details p { white-space: pre-wrap; word-break: break-all; overflow-wrap: break-word; }"
         "</style></head><body>";
