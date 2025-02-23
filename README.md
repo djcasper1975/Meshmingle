@@ -21,6 +21,6 @@
         <p>You can install/flash directly to your device from the links below using your PC. No additional software required (some browsers may not work; Chrome is recommended). Ensure you have the necessary drivers installed.</p>
         <a href="http://meshmingle.co.uk" class="button">Click here to flash your device using web browser.</a>
         <br>
-        <a href="https://www.facebook.com/groups/903502501920003">Facebook</a>                                                                                           
+        <a href="https://www.facebook.com/groups/903502501920003">Click here for Facebook Group.</a>                                                                                           
     </div>
 </body>
