@@ -1,5 +1,5 @@
-//Test v1.00.029 
-//22-02-2025
+//Test v1.00.030 
+//27-02-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -8,16 +8,7 @@
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins thereafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//fixed html page issues
-//Added Rx Boost
-//important performance updates.
-//wifi was relaying way too much causing flag resets for lora relays when lora and wifi in range multiple nodes close.
-//added support for heltec v3.2
-//added tx log you can access by clicking your node id on mainpage.
-//you can now choese v3 or v3.2 board instead of compatability for both
-//altered relay logic again.
-//wifi does not keep relaying the same message when recived through wifi asnd varous lora relays.
-//Now also introducing a dynamic slot system for relayed messages that uses the measured RX RSSI from the message being relayed.
+
 
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -1441,7 +1432,7 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Meshmingle Chat Room</title>
+  <title>Meshmingle Public Chat</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -1788,9 +1779,9 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
 <body>
   <div class="warning">For your safety, do not share your location or any personal information!</div>
   
-  <h2>Meshmingle Chat</h2>
+  <h2>Meshmingle Public Chat</h2>
   
-  <div id="deviceCount">Mesh Nodes: 0</div>
+  <div id="deviceCount">Wifi Mesh Nodes: 0</div>
   
   <div id="chat-container">
     <ul id="messageList"></ul>
@@ -1960,7 +1951,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
             }
           });
           const groupedIndirectArray = Object.values(groupedIndirect);
-          document.getElementById('indirectCount').innerText = 'Indirect Nodes (Relayed) Active: ' + groupedIndirectArray.length;
+          document.getElementById('indirectCount').innerText = 'Indirect Nodes Last Seen: ' + groupedIndirectArray.length;
           groupedIndirectArray.forEach((node, index) => {
             const li = document.createElement('li');
             li.classList.add('node');
@@ -2007,7 +1998,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
   </div>
   
   <div class="node-section">
-    <span id="indirectCount">Indirect Nodes (Relayed) Active: 0</span>
+    <span id="indirectCount">Indirect Nodes Last Seen: 0</span>
     <ul id="indirectNodeList"></ul>
   </div>
 </body>
@@ -2299,7 +2290,7 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
   <div class="nav-links">
     <a href="/nodes">NodeList</a> | <a href="/">Chat</a>
   </div>
-  <h2>LoRa 24hr History</h2>
+  <h2>LoRa 24hr RX History</h2>
   <div class="node-id" id="nodeIdDisplay">Node ID: Loading...</div>
   <div id="historyContainer"></div>
 </body>
@@ -2389,7 +2380,7 @@ const char txHistoryPageHtml[] PROGMEM = R"rawliteral(
   <div class="nav-links">
     <a href="/">Chat</a> | <a href="/nodes">Nodes</a> | <a href="/metrics">History</a>
   </div>
-  <h2>TX History</h2>
+  <h2>Lora 24hr TX History</h2>
   <div id="historyContainer"></div>
 </body>
 </html>
