@@ -1,8 +1,9 @@
-//Test v1.00.024 
-//15-02-2025
+//Test v1.00.031 
+//03-05-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //Changed network name.
 //added private messages to other nodes.
+//added wifi channel config
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -23,6 +24,7 @@
 #define MESH_SSID       "meshmingle.co.uk"
 #define MESH_PASSWORD   ""
 #define MESH_PORT       5555
+#define MESH_CHANNEL   3
 
 // Global mesh/network objects:
 painlessMesh mesh;
@@ -231,7 +233,7 @@ void updateMeshData() {
 
 void initMesh() {
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT);
+  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT, WIFI_AP_STA, MESH_CHANNEL);
   mesh.onReceive(receivedCallback);
   mesh.onChangedConnections([](){
     updateMeshData();
