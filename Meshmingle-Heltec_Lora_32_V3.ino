@@ -1,5 +1,5 @@
-//Test v1.00.030 
-//27-02-2025
+//Test v1.00.031 
+//03-05-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -8,6 +8,7 @@
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins thereafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
+//Added channel number for wifi settings.
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -44,6 +45,7 @@
 #define MESH_SSID "meshmingle.co.uk"
 #define MESH_PASSWORD ""  //WARNING!! If you have set this and then unset it and reflash you must do FULL ERASE FIRST.
 #define MESH_PORT 5555
+#define MESH_CHANNEL 3     // <— add your chosen channel here (1–13 for 2.4 GHz)
 
 // LoRa Parameters
 #define PAUSE 5400000  //Required timeout Time for dutycycle (54 Min)
@@ -1013,7 +1015,7 @@ void setup() {
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT);
+  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT, WIFI_AP_STA, MESH_CHANNEL);
   mesh.onReceive(receivedCallback);
   mesh.onChangedConnections([]() {
     updateMeshData();
