@@ -1,4 +1,4 @@
-//Test v1.00.031 
+//Test v1.00.032 
 //03-05-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
@@ -9,8 +9,7 @@
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //Added channel number for wifi settings.
-
-
+//Fixed channel issues we now have 1 node auto assign
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -36,6 +35,7 @@
 #include <DNSServer.h>
 #include <Wire.h>
 #include <esp_task_wdt.h> // Watchdog timer library
+#include <esp_wifi.h>             // for esp_wifi_ap_get_sta_list()
 #include <vector>         // For handling list of messages and our queue
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>     //7.1.2
@@ -88,6 +88,28 @@ struct TransmissionStatus {
 
 // Map to track transmissions by message ID
 std::map<String, TransmissionStatus> messageTransmissions;
+
+// --- CLIENT TRACKING GLOBALS & HELPERS ---
+
+// Keep every MAC we’ve ever seen
+static std::set<String> clientMacs;
+
+// Convert raw 6-byte MAC to "AA:BB:CC:DD:EE:FF"
+static String macToString(const uint8_t* mac) {
+  char buf[18];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+// Pull the current AP station list and add to our master set
+void updateClientList() {
+  wifi_sta_list_t staList;
+  esp_wifi_ap_get_sta_list(&staList);
+  for (int i = 0; i < staList.num; i++) {
+    clientMacs.insert(macToString(staList.sta[i].mac));
+  }
+}
 
 // ---------------------------------------------------------------------
 // NEW: Relay Log Definitions
@@ -986,7 +1008,7 @@ void setup() {
   #endif
   display.init();
   #ifdef HELTEC_V3_2
-  display.setContrast(255);
+  display.setContrast(200);
   #endif
   display.flipScreenVertically();
   display.clear();
@@ -1011,7 +1033,7 @@ void setup() {
   radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF);
   delay(2000);
 
-  WiFi.softAP(MESH_SSID, MESH_PASSWORD);
+  //WiFi.softAP(MESH_SSID, MESH_PASSWORD);  // removed because we was on ch1 then 3
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
@@ -1020,7 +1042,7 @@ void setup() {
   mesh.onChangedConnections([]() {
     updateMeshData();
   });
-  mesh.setContainsRoot(false);
+  //mesh.setContainsRoot(false); this was causing us to never have a root or have one auto assigned.
 
   setupServerRoutes();
   server.begin();
@@ -1343,7 +1365,7 @@ void loop() {
 
 void initMesh() {
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT);
+  mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT, WIFI_AP_STA, MESH_CHANNEL);
   mesh.onReceive(receivedCallback);
 
   mesh.onChangedConnections([]() {
@@ -2388,6 +2410,57 @@ const char txHistoryPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// The PROGMEM HTML page at /clients
+const char clientsPageHtml[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshmingle Clients</title>
+  <style>
+    body { font-family: Arial,sans-serif; background:#f4f7f6; margin:0; padding:20px; text-align:center; }
+    h2 { color:#333; margin-bottom:10px; }
+    #macList { list-style:none; padding:0; max-width:400px; margin:auto; }
+    .mac-item { background:#fff; border:1px solid #ccc; border-radius:5px; padding:8px; margin:5px 0; font-family:monospace; }
+    .nav-links { margin-bottom:20px; }
+    .nav-links a { margin:0 10px; color:#007bff; text-decoration:none; font-weight:bold; }
+    .nav-links a:hover { text-decoration:underline; }
+  </style>
+  <script>
+    function fetchClients() {
+      fetch('/clientsData')
+        .then(r => r.json())
+        .then(data => {
+          const ul = document.getElementById('macList');
+          ul.innerHTML = '';
+          data.macs.forEach(mac => {
+            const li = document.createElement('li');
+            li.className = 'mac-item';
+            li.textContent = mac;
+            ul.appendChild(li);
+          });
+        })
+        .catch(console.error);
+    }
+    window.onload = function() {
+      fetchClients();
+      setInterval(fetchClients, 10000);
+    };
+  </script>
+</head>
+<body>
+  <div class="nav-links">
+    <a href="/">Chat</a>
+    <a href="/nodes">Nodes</a>
+    <a href="/clients">Clients</a>
+  </div>
+  <h2>All Clients (Past &amp; Present)</h2>
+  <ul id="macList"></ul>
+</body>
+</html>
+)rawliteral";
+
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
   uint64_t ageSec = ageMs / 1000;
@@ -2796,6 +2869,26 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
       html += "</div></body></html>";
       request->send(200, "text/html", html);
     }
+  });
+
+    // --- Clients page: serves HTML ---
+  server.on("/clients", HTTP_GET, [](AsyncWebServerRequest* request){
+    updateClientList();  // refresh our master list
+    request->send_P(200, "text/html", clientsPageHtml);
+  });
+
+  // --- JSON endpoint for JS to pull MAC list ---
+  server.on("/clientsData", HTTP_GET, [](AsyncWebServerRequest* request){
+    updateClientList();
+    String json = "{\"macs\":[";
+    bool first = true;
+    for (const auto& m : clientMacs) {
+      if (!first) json += ",";
+      json += "\"" + m + "\"";
+      first = false;
+    }
+    json += "]}";
+    request->send(200, "application/json", json);
   });
 }
 
