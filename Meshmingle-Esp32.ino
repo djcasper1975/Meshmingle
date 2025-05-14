@@ -1,9 +1,10 @@
-//Test v1.00.031 
-//03-05-2025
+//Test v1.00.032 
+//14-05-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //Changed network name.
 //added private messages to other nodes.
 //added wifi channel config
+//auto root is applyed now.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -16,6 +17,7 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
+#include <esp_wifi.h>             // for esp_wifi_ap_get_sta_list()
 #include <vector>
 #include <map>
 #include <set>
@@ -30,6 +32,28 @@
 painlessMesh mesh;
 AsyncWebServer server(80);
 DNSServer dnsServer;
+
+// --- CLIENT TRACKING GLOBALS & HELPERS ---
+
+// Keep every MAC we’ve ever seen
+static std::set<String> clientMacs;
+
+// Convert raw 6-byte MAC to "AA:BB:CC:DD:EE:FF"
+static String macToString(const uint8_t* mac) {
+  char buf[18];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+// Pull the current AP station list and add to our master set
+void updateClientList() {
+  wifi_sta_list_t staList;
+  esp_wifi_ap_get_sta_list(&staList);
+  for (int i = 0; i < staList.num; i++) {
+    clientMacs.insert(macToString(staList.sta[i].mac));
+  }
+}
 
 // Global variables for node identity and message tracking:
 int totalNodeCount = 0;
@@ -238,7 +262,7 @@ void initMesh() {
   mesh.onChangedConnections([](){
     updateMeshData();
   });
-  mesh.setContainsRoot(false);
+//mesh.setContainsRoot(false); this was causing us to never have a root or have one auto assigned.
 }
 
 // -----------------------------
@@ -811,6 +835,57 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// The PROGMEM HTML page at /clients
+const char clientsPageHtml[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meshmingle Clients</title>
+  <style>
+    body { font-family: Arial,sans-serif; background:#f4f7f6; margin:0; padding:20px; text-align:center; }
+    h2 { color:#333; margin-bottom:10px; }
+    #macList { list-style:none; padding:0; max-width:400px; margin:auto; }
+    .mac-item { background:#fff; border:1px solid #ccc; border-radius:5px; padding:8px; margin:5px 0; font-family:monospace; }
+    .nav-links { margin-bottom:20px; }
+    .nav-links a { margin:0 10px; color:#007bff; text-decoration:none; font-weight:bold; }
+    .nav-links a:hover { text-decoration:underline; }
+  </style>
+  <script>
+    function fetchClients() {
+      fetch('/clientsData')
+        .then(r => r.json())
+        .then(data => {
+          const ul = document.getElementById('macList');
+          ul.innerHTML = '';
+          data.macs.forEach(mac => {
+            const li = document.createElement('li');
+            li.className = 'mac-item';
+            li.textContent = mac;
+            ul.appendChild(li);
+          });
+        })
+        .catch(console.error);
+    }
+    window.onload = function() {
+      fetchClients();
+      setInterval(fetchClients, 10000);
+    };
+  </script>
+</head>
+<body>
+  <div class="nav-links">
+    <a href="/">Chat</a>
+    <a href="/nodes">Nodes</a>
+    <a href="/clients">Clients</a>
+  </div>
+  <h2>All Clients (Past &amp; Present)</h2>
+  <ul id="macList"></ul>
+</body>
+</html>
+)rawliteral";
+
 // Setup all server routes:
 void setupServerRoutes() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -901,6 +976,27 @@ void setupServerRoutes() {
     transmitViaWiFi(constructedMessage);
     request->redirect("/");
   });
+
+    // --- Clients page: serves HTML ---
+  server.on("/clients", HTTP_GET, [](AsyncWebServerRequest* request){
+    updateClientList();  // refresh our master list
+    request->send_P(200, "text/html", clientsPageHtml);
+  });
+
+  // --- JSON endpoint for JS to pull MAC list ---
+  server.on("/clientsData", HTTP_GET, [](AsyncWebServerRequest* request){
+    updateClientList();
+    String json = "{\"macs\":[";
+    bool first = true;
+    for (const auto& m : clientMacs) {
+      if (!first) json += ",";
+      json += "\"" + m + "\"";
+      first = false;
+    }
+    json += "]}";
+    request->send(200, "application/json", json);
+  });
+
 }
 
 // Initializes the web server.
@@ -920,6 +1016,7 @@ void setup() {
   // Set up the web server:
   setupServer();
   // (Optional: additional WiFi configuration if needed.)
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 }
 
 void loop() {
