@@ -1,5 +1,5 @@
 //Test v1.00.032 
-//14-05-2025
+//23-05-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -10,6 +10,9 @@
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //Added channel number for wifi settings.
 //Fixed channel issues we now have 1 node auto assign
+//added battery monitor its not the best but its something for now.(heltec sux for this)
+//Added 0% actual voltage
+//Added battery cache instead of refreshing readings at will.
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -18,12 +21,17 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-// Uncomment the line below to enable Heltec V3.2 specific code.
-//
-#define HELTEC_V3_2
-//
-// If not defined, we assume Heltec V3.
-#ifndef HELTEC_V3_2
+// Uncomment to enable Heltec V3.2-specific logic
+//#define HELTEC_V3_2
+
+#ifdef HELTEC_V3_2
+  // V3.2: HIGH = connect divider, LOW = disconnect
+  #define FET_CONNECT    HIGH
+  #define FET_DISCONNECT LOW
+#else
+  // V3:   LOW  = connect divider, HIGH = disconnect
+  #define FET_CONNECT    LOW
+  #define FET_DISCONNECT HIGH
 #endif
 //
 #define RADIOLIB_SX1262
@@ -40,6 +48,9 @@
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>     //7.1.2
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
+// ── Battery monitoring ───────────────────────────────────
+#define VBAT_Read  1    // ADC1 channel 1 (divider output)
+#define ADC_Ctrl   37   // GPIO37 drives the FET gate
 
 // Meshmingle Parameters
 #define MESH_SSID "meshmingle.co.uk"
@@ -60,6 +71,18 @@
 bool enableRxBoost = true; //enable or disable RX Boost Mode
 bool sendAggregatedHeartbeats = false;  //0 hop nodelist sharing. Theres issues with this right now!!!!
 bool bypassDutyCycle = false;  // Enable or Disable DutyCycle (For Non EU Use ONLY!!!)
+
+// Calibration: actual vs raw based on 3.7 v 1100mah 4.07w Lithium Battery
+const float measuredV  = 4.20f;   // battery full
+const float reportedV  = 3.800f;  // divider pin at full
+const float reportedV0 = 2.800f;  // divider pin at empty
+const float measuredV0 = (reportedV0 / reportedV) * measuredV;
+
+// ——— BATTERY CACHE ———
+float   cachedBatteryVoltage   = 0.0f;
+int     cachedBatteryPercentage= 0;
+unsigned long lastBatteryCacheUpdate = 0;
+const unsigned long batteryCacheInterval = 60000UL; // 60 s
 
 // ---------------------------------------------------------------------
 // NEW: Define an enum to track the origin of each message
@@ -1006,6 +1029,13 @@ void setup() {
     digitalWrite(Vext, LOW);
     delay(100);
   #endif
+  // Prepare ADC and gate-control pin
+  pinMode(ADC_Ctrl, OUTPUT);
+  digitalWrite(ADC_Ctrl, FET_DISCONNECT);
+  pinMode(VBAT_Read, INPUT);
+  adcAttachPin(VBAT_Read);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);     // ← explicit, even though it's the default
   display.init();
   #ifdef HELTEC_V3_2
   display.setContrast(200);
@@ -1015,7 +1045,8 @@ void setup() {
   display.setFont(ArialMT_Plain_10);
   drawMainScreen();
 
-  showScrollingMonospacedAsciiArt(); 
+  showScrollingMonospacedAsciiArt();
+  Serial.println("Setup complete. Starting battery readings...");
 
   RADIOLIB_OR_HALT(radio.begin());
   radio.setDio1Action(onRadioRx);
@@ -1063,12 +1094,36 @@ void setup() {
   global_jitter_offset = chip_offset % 10000;
   nextHeartbeatTime = millis() + firstHeartbeatDelayValue + global_jitter_offset;
   nextAggregatedHeartbeatTime = millis() + aggregatedHeartbeatInterval + global_jitter_offset;
+
+// Prime the battery cache immediately
+lastBatteryCacheUpdate = millis();
+uint16_t mV = readBatteryVoltage();
+cachedBatteryVoltage = mV / 1000.0f;
+cachedBatteryPercentage = constrain(
+  int((cachedBatteryVoltage - measuredV0) / (measuredV - measuredV0) * 100),
+  0, 100
+);
 }
 
 void loop() {
+// ——— cache battery every 60 seconds ———
+if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
+  lastBatteryCacheUpdate = millis();
+
+  // read raw mV
+  uint16_t mV = readBatteryVoltage();
+  cachedBatteryVoltage    = mV / 1000.0f;
+  // compute percentage the same way your endpoint will
+  int pct = (int)((cachedBatteryVoltage - measuredV0) 
+                 / (measuredV - measuredV0) * 100.0f);
+  cachedBatteryPercentage = constrain(pct, 0, 100);
+
+  // still log to serial if you like
+  Serial.printf("Cached battery: %.3f V (%d%%)\n", 
+                cachedBatteryVoltage, cachedBatteryPercentage);
+}
   esp_task_wdt_reset();
   heltec_loop();
-
   mesh.update();
 
   if (millis() >= nextHeartbeatTime) {
@@ -1363,6 +1418,8 @@ void loop() {
   }
 }
 
+
+
 void initMesh() {
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
   mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT, WIFI_AP_STA, MESH_CHANNEL);
@@ -1373,6 +1430,34 @@ void initMesh() {
   });
 
   mesh.setContainsRoot(false);
+}
+
+uint16_t readBatteryVoltage() {
+  // ADC & divider parameters
+  const int resolution = 12;
+  const int adcMax = (1 << resolution) - 1;
+  const float adcRef = 3.3f;
+  const float R1 = 390.0f;
+  const float R2 = 100.0f;
+// (we already declared measuredV, reportedV, reportedV0, measuredV0 as globals above)
+
+  // Optimize sampling: connect once, take quick reads, then disconnect
+  const int samples = 5;
+  long sumRaw = 0;
+  digitalWrite(ADC_Ctrl, FET_CONNECT);
+  delay(5);
+  for (int i = 0; i < samples; ++i) {
+    sumRaw += analogRead(VBAT_Read);
+    // tiny pause so ADC stabilizes; can be omitted if too slow
+    // delay(1);
+  }
+  digitalWrite(ADC_Ctrl, FET_DISCONNECT);
+
+  float avgRaw = sumRaw / float(samples);
+// map raw ADC reading up to real battery volts using the global calibration
+  float factor = (adcRef / adcMax) * ((R1 + R2) / R2) * ( ::measuredV / ::reportedV );
+  float volts = avgRaw * factor;
+  return uint16_t(volts * 1000.0f);
 }
 
 void receivedCallback(uint32_t from, String& message) {
@@ -1798,9 +1883,28 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
     setInterval(fetchData, 5000);
     document.getElementById('messageForm').addEventListener('submit', sendMessage);
   };
+// ——————————————————————————————  
+// Poll the battery endpoint every 60 s
+// ——————————————————————————————
+function updateBattery() {
+  fetch('/battery')
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('batVolt').textContent = data.voltage.toFixed(3);
+      document.getElementById('batPct').textContent = data.percentage;
+    })
+    .catch(console.error);
+}
+setInterval(updateBattery, 60000);
+updateBattery();  // fire on load
+
+
 </script>
 </head>
 <body>
+  <div id="batteryStatus" style="margin:10px; font-size:0.9em; color:#333;">
+    Battery: <span id="batVolt">--</span> V (<span id="batPct">--</span>%)
+  </div>
   <div class="warning">For your safety, do not share your location or any personal information!</div>
   
   <h2>Meshmingle Public Chat</h2>
@@ -2890,6 +2994,17 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
     json += "]}";
     request->send(200, "application/json", json);
   });
+
+  // —————————————————————————————————————————————————————————————————
+//  Battery status endpoint
+// —————————————————————————————————————————————————————————————————
+server.on("/battery", HTTP_GET, [](AsyncWebServerRequest* request) {
+  // respond with the last‐cached values
+  String json = String("{\"voltage\":") + String(cachedBatteryVoltage, 3)
+              + ",\"percentage\":" + String(cachedBatteryPercentage) + "}";
+  request->send(200, "application/json", json);
+});
+
 }
 
 void updateMeshData() {
