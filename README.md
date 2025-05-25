@@ -4,6 +4,7 @@
 </head>
 <body>
     <div class="container">
+        <img src="heltecv32.jpg" alt="heltec v3.2 device" width="300" height="200">
         <h1>Welcome to Meshmingle</h1>
         <p>Meshmingle is a mesh powered message network that works using WiFi and LoRa to extend range beyond your home.</p>
         <p>Each device will automatically pair with other devices nearby and act as relays. The more relays/nodes the more distance and reliability.</p>
