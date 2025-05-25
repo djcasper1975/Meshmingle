@@ -17,7 +17,16 @@
     <br>
         <a href="https://www.aliexpress.com/item/1005008177147021.html" class="button" target="_blank">Buy Heltec V3 LoRa AliExpress</a>
         <h2>Flash Your Device</h2>
-        <img src="heltecv3.jpg" alt="heltec v3 device" width="300" height="200">
+        <!-- Wrap the thumbnail in an anchor that targets the full-size image -->
+<a href="heltecv32.jpg" target="_blank">   <!-- omit target="_blank" if you prefer same-tab -->
+  <img
+    src="heltecv32.jpg"
+    alt="Heltec V3.2 device"
+    width="300"
+    height="200"
+    style="cursor:pointer"
+  >
+</a>
         <img src="Esp32Vroom.jpg" alt="Esp32 Vroom device" width="300" height="200">
         <br>
         <img src="HeltecV3b.jpg" alt="HeltecV3" width="300" height="200">
