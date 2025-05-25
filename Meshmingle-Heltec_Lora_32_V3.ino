@@ -28,7 +28,7 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-// Uncomment to enable Heltec V3 V3.1 -specific logic
+// Uncomment line below to enable Heltec V3 V3.1 - specific logic otherwise its V3.2
 //#define HELTEC_V3
 
 #ifdef HELTEC_V3
