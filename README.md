@@ -5,7 +5,7 @@
 <body>
     <div class="container">
         <h1>Welcome to Meshmingle</h1>
-        <p>Meshmingle is a free homebrew mesh powered message network that works through WiFi and LoRa to extend range beyond your home.</p>
+        <p>Meshmingle is a mesh powered message network that works using WiFi and LoRa to extend range beyond your home.</p>
         <p>Each device will automatically pair with other devices nearby and act as relays. The more relays/nodes the more distance and reliability.</p>
         <p>When connected to WiFi via a mobile device, open your browser and go to <a href="http://mesh.local">http://mesh.local</a> to start.</p>
         <p>Setup is easy! Just power up your device after flashing, and you're good to go.</p>
