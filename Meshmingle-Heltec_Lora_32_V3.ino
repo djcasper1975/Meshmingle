@@ -1,5 +1,5 @@
 //Test v1.00.032 
-//23-05-2025
+//25-05-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -13,6 +13,13 @@
 //added battery monitor its not the best but its something for now.(heltec sux for this)
 //Added 0% actual voltage
 //Added battery cache instead of refreshing readings at will.
+//we now calculate empty and full charge and save it for calibration. heltec voltate dividers and batterys all have diff values. hopefully this will be a little better.
+//we need to fully charge the battery until orange light goes OFF. Then let the battery run flat. Now you have a calibrated battery and board. Next we need to solve the charging voltage rise and drop when not.
+//added voltage spike reduction when charging currently at -100mv of each reading so when unplugged we dont drop in charge 10% by unplugging.
+//V3.2 is now default if you want v3 you must define it.
+//changed delay to heltec_delay now the other button powers the unit on and off yippeeee
+//Added a battery cell beside the title on oled screen.
+//
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
@@ -21,17 +28,17 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-// Uncomment to enable Heltec V3.2-specific logic
-//#define HELTEC_V3_2
+// Uncomment to enable Heltec V3-specific logic
+//#define HELTEC_V3
 
-#ifdef HELTEC_V3_2
-  // V3.2: HIGH = connect divider, LOW = disconnect
-  #define FET_CONNECT    HIGH
-  #define FET_DISCONNECT LOW
-#else
+#ifdef HELTEC_V3
   // V3:   LOW  = connect divider, HIGH = disconnect
   #define FET_CONNECT    LOW
   #define FET_DISCONNECT HIGH
+#else
+  // V3.2: HIGH = connect divider, LOW = disconnect
+  #define FET_CONNECT    HIGH
+  #define FET_DISCONNECT LOW
 #endif
 //
 #define RADIOLIB_SX1262
@@ -48,6 +55,9 @@
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>     //7.1.2
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
+#include <Preferences.h>    // ← add this
+
+
 // ── Battery monitoring ───────────────────────────────────
 #define VBAT_Read  1    // ADC1 channel 1 (divider output)
 #define ADC_Ctrl   37   // GPIO37 drives the FET gate
@@ -66,7 +76,6 @@
 #define TRANSMIT_POWER 22 //This is max power for This Boards EU868 Config.
 #define CODING_RATE 8 
 
-
 // Some Global Variables
 bool enableRxBoost = true; //enable or disable RX Boost Mode
 bool sendAggregatedHeartbeats = false;  //0 hop nodelist sharing. Theres issues with this right now!!!!
@@ -77,6 +86,28 @@ const float measuredV  = 4.20f;   // battery full
 const float reportedV  = 3.800f;  // divider pin at full
 const float reportedV0 = 2.800f;  // divider pin at empty
 const float measuredV0 = (reportedV0 / reportedV) * measuredV;
+
+// ——— Battery min/max persistence ———
+Preferences prefs;
+float      vMin, vMax;               
+const float presetVMin = measuredV;  
+const float presetVMax = measuredV0;
+// how much surface-charge offset to subtract from your peak
+const float calibrationOffset = 0.100f; // 100 mV we minus this value of our max v reading when charging to avoid voltage drop when charger is off and batt full. you can tweek this for more accuracy. or set to 0.0 for none.
+const float updateThreshold = 0.005f; // 5 mV
+
+// nominal battery endpoints
+const float nominalVmin = 3.20f;
+const float nominalVmax = 4.20f;
+
+float  calSlope     = 1.0f;
+float  calIntercept = 0.0f;
+
+// raw-extrema storage (instead of vMin/vMax)
+float vMinRaw, vMaxRaw;
+
+extern float  cachedBatteryVoltage;
+extern int    cachedBatteryPercentage;
 
 // ——— BATTERY CACHE ———
 float   cachedBatteryVoltage   = 0.0f;
@@ -176,6 +207,14 @@ const uint64_t DIRECT_NODE_TIMEOUT = 16UL * 60UL * 1000UL; // 16 minutes in mill
 
 uint64_t cumulativeTxTime = 0;
 uint64_t dutyCycleStartTime = 0;
+
+void recalcCalibration() {
+  // map [vMinRaw…vMaxRaw] → [nominalVmin…nominalVmax]
+  calSlope     = (nominalVmax - nominalVmin) / (vMaxRaw - vMinRaw);
+  calIntercept = nominalVmin - calSlope * vMinRaw;
+  Serial.printf("Recalculated mapping: Vout = %.3f·Vraw + %.3f\n",
+                calSlope, calIntercept);
+}
 
 void resetDutyCycle() {
     cumulativeTxTime = 0;
@@ -537,7 +576,6 @@ String determineTxType(const String &message) {
   }
 }
 
-
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
 // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
 // Modified to take an additional parameter measuredRssi (default -100) so that for relayed messages we can use the measured RX RSSI.
@@ -699,7 +737,7 @@ void showScrollingMonospacedAsciiArt() {
       drawMonospacedLine(offsetX, verticalOffset + i * lineHeight, lines[i], charWidth);
     }
     display.display();
-    delay(3000);
+    heltec_delay(3000);
     return;
   }
 
@@ -712,7 +750,7 @@ void showScrollingMonospacedAsciiArt() {
       drawMonospacedLine(-offset, verticalOffset + i * lineHeight, lines[i], charWidth);
     }
     display.display();
-    delay(30);
+    heltec_delay(30);
   }
 }
 
@@ -723,42 +761,61 @@ void drawMainScreen(long txTimeMillis = -1) {
 
   display.clear();
   display.setFont(ArialMT_Plain_10);
-  int16_t titleWidth = display.getStringWidth("Meshmingle 1.0");
-  display.drawString((128 - titleWidth) / 2, 0, "Meshmingle 1.0");
-  display.drawString(0, 13, "Node ID: " + getCustomNodeId(getNodeId()));
 
-  uint64_t currentTime = millis();
-  int activeDirectLoRaNodes = 0;
-  const uint64_t DIRECT_TIMEOUT = 900000; // 15 minutes
-  for (const auto& node : loraNodes) {
-    if (currentTime - node.second.lastSeen <= DIRECT_TIMEOUT) {
-      activeDirectLoRaNodes++;
+  // ——— Title ———
+  const char* title = "Meshmingle 1.0";
+  int16_t titleWidth = display.getStringWidth(title);
+  display.drawString((128 - titleWidth) / 2, 0, title);
+
+  // ——— Battery icon ———
+  // how many cells to fill (0–4)
+  int pct      = cachedBatteryPercentage;          
+  int segments = (pct + 24) / 25;                  
+  // top-right corner
+  const int bx = 128 - 19; // 16px body + 2px cap + 1px margin
+  const int by = 0;
+  // outline
+  display.drawRect(bx,   by, 16, 8);
+  // positive terminal
+  display.drawRect(bx + 16, by + 2, 2, 4);
+  // fill cells
+  for (int i = 0; i < 4; i++) {
+    if (i < segments) {
+      display.fillRect(bx + 1 + i*4, by + 1, 3, 6);
     }
   }
-  int totalActiveLoRaNodes = activeDirectLoRaNodes;  
+
+  // ——— Node info ———
+  display.drawString(0, 13, "Node ID: " + getCustomNodeId(getNodeId()));
+
+  // ——— Mesh counts ———
+  uint64_t currentTime = millis();
+  int activeDirectLoRa = 0;
+  const uint64_t DIRECT_TIMEOUT = 900000; // 15 min
+  for (auto& kv : loraNodes) {
+    if (currentTime - kv.second.lastSeen <= DIRECT_TIMEOUT) activeDirectLoRa++;
+  }
   int wifiCount = totalNodeCount;
-
-  String combinedNodes = "WiFi Nodes: " + String(wifiCount) + "  LoRa: " + String(totalActiveLoRaNodes);
-  int16_t combinedWidth = display.getStringWidth(combinedNodes);
-  if (combinedWidth > 128) {
-    combinedNodes = "WiFi: " + String(wifiCount) + " LoRa: " + String(totalActiveLoRaNodes);
+  String combined = "WiFi: " + String(wifiCount) + "  LoRa: " + String(activeDirectLoRa);
+  if (display.getStringWidth(combined) > 128) {
+    combined = "WiFi:" + String(wifiCount) + " LoRa:" + String(activeDirectLoRa);
   }
-  display.drawString(0, 27, combinedNodes);
+  display.drawString(0, 27, combined);
 
-  if (dutyCycleActive) {
-    display.drawString(0, 40, "Duty Cycle Limit Reached!");
-  } else {
-    display.drawString(0, 40, "LoRa Tx Allowed");
-  }
+  // ——— Duty cycle / TxOK ———
+  display.drawString(0, 40, dutyCycleActive 
+                                ? "Duty Cycle Limit Reached!"
+                                : "LoRa Tx Allowed");
 
   if (lastTxTimeMillis >= 0) {
-    String txMessage = "TxOK (" + String(lastTxTimeMillis) + " ms)";
-    int16_t txMessageWidth = display.getStringWidth(txMessage);
-    display.drawString((128 - txMessageWidth) / 2, 54, txMessage);
+    String txMsg = "TxOK (" + String(lastTxTimeMillis) + " ms)";
+    int16_t w = display.getStringWidth(txMsg);
+    display.drawString((128 - w) / 2, 54, txMsg);
   }
 
   display.display();
 }
+
 
 void displayCarousel() {
   unsigned long currentMillis = millis();
@@ -1019,16 +1076,17 @@ void onRadioRx() {
 }
 
 void setup() {
-  Serial.begin(115200);
-
   heltec_setup();
   Serial.println("Initializing LoRa radio...");
   heltec_led(0);
-  #ifdef HELTEC_V3_2
-    pinMode(Vext, OUTPUT);
-    digitalWrite(Vext, LOW);
-    delay(100);
-  #endif
+#ifdef HELTEC_V3
+  // (nothing special for V3)
+#else
+  // V3.2 only:
+  pinMode(Vext, OUTPUT);
+  digitalWrite(Vext, LOW);
+  heltec_delay(100);
+#endif
   // Prepare ADC and gate-control pin
   pinMode(ADC_Ctrl, OUTPUT);
   digitalWrite(ADC_Ctrl, FET_DISCONNECT);
@@ -1037,9 +1095,12 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);     // ← explicit, even though it's the default
   display.init();
-  #ifdef HELTEC_V3_2
+#ifdef HELTEC_V3
+  // (V3 uses default contrast)
+#else
+  // V3.2 boost:
   display.setContrast(200);
-  #endif
+#endif
   display.flipScreenVertically();
   display.clear();
   display.setFont(ArialMT_Plain_10);
@@ -1062,7 +1123,7 @@ void setup() {
   RADIOLIB_OR_HALT(radio.setOutputPower(TRANSMIT_POWER));
 
   radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF);
-  delay(2000);
+  heltec_delay(2000);
 
   //WiFi.softAP(MESH_SSID, MESH_PASSWORD);  // removed because we was on ch1 then 3
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
@@ -1103,28 +1164,60 @@ cachedBatteryPercentage = constrain(
   int((cachedBatteryVoltage - measuredV0) / (measuredV - measuredV0) * 100),
   0, 100
 );
+// ——— Persistent raw min/max init ———
+prefs.begin("battery", false);
+// default vMinRaw to the measured empty voltage, vMaxRaw to the measured full voltage
+vMinRaw = prefs.getFloat("vMinRaw", measuredV0);
+vMaxRaw = prefs.getFloat("vMaxRaw", measuredV);
+recalcCalibration();
+Serial.printf("Loaded vMinRaw: %.3f V, vMaxRaw: %.3f V\n", vMinRaw, vMaxRaw);
+
 }
 
 void loop() {
-// ——— cache battery every 60 seconds ———
-if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
-  lastBatteryCacheUpdate = millis();
-
-  // read raw mV
-  uint16_t mV = readBatteryVoltage();
-  cachedBatteryVoltage    = mV / 1000.0f;
-  // compute percentage the same way your endpoint will
-  int pct = (int)((cachedBatteryVoltage - measuredV0) 
-                 / (measuredV - measuredV0) * 100.0f);
-  cachedBatteryPercentage = constrain(pct, 0, 100);
-
-  // still log to serial if you like
-  Serial.printf("Cached battery: %.3f V (%d%%)\n", 
-                cachedBatteryVoltage, cachedBatteryPercentage);
-}
   esp_task_wdt_reset();
   heltec_loop();
   mesh.update();
+  // ——— cache & calibrate battery every 60 seconds ———
+  if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
+    lastBatteryCacheUpdate = millis();
+
+    // 1) raw divider reading in volts
+    float rawV = readBatteryVoltage() / 1000.0f;
+
+    // 2a) update raw MIN only if it's at least 5 mV below the saved value
+    if (rawV <= vMinRaw - updateThreshold) {
+      vMinRaw = rawV;
+      prefs.putFloat("vMinRaw", vMinRaw);
+      Serial.printf("New vMinRaw (saved): %.3f V\n", vMinRaw);
+    }
+
+    // 2b) update raw MAX (with calibrationOffset) only if it's at least 5 mV above
+    float candidateMax = rawV - calibrationOffset;
+    if (candidateMax >= vMaxRaw + updateThreshold) {
+      vMaxRaw = candidateMax;
+      prefs.putFloat("vMaxRaw", vMaxRaw);
+      Serial.printf("New vMaxRaw (saved): %.3f V\n", vMaxRaw);
+    }
+
+    // 3) map rawV → calibrated [nominalVmin…nominalVmax]
+    float calV = nominalVmin
+               + (rawV - vMinRaw)
+                 * (nominalVmax - nominalVmin)
+                 / (vMaxRaw - vMinRaw);
+    calV = constrain(calV, nominalVmin, nominalVmax);
+
+    // 4) update your displayed/cache values
+    cachedBatteryVoltage    = calV;
+    cachedBatteryPercentage = constrain(
+      int((calV - nominalVmin)
+          / (nominalVmax - nominalVmin)
+          * 100.0f),
+      0, 100
+    );
+    Serial.printf("Cached battery: %.3f V (%d%%)\n",
+                  cachedBatteryVoltage, cachedBatteryPercentage);
+  }
 
   if (millis() >= nextHeartbeatTime) {
     sendHeartbeat();
@@ -1418,8 +1511,6 @@ if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
   }
 }
 
-
-
 void initMesh() {
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
   mesh.init(MESH_SSID, MESH_PASSWORD, MESH_PORT, WIFI_AP_STA, MESH_CHANNEL);
@@ -1445,11 +1536,11 @@ uint16_t readBatteryVoltage() {
   const int samples = 5;
   long sumRaw = 0;
   digitalWrite(ADC_Ctrl, FET_CONNECT);
-  delay(5);
+  heltec_delay(5);
   for (int i = 0; i < samples; ++i) {
     sumRaw += analogRead(VBAT_Read);
     // tiny pause so ADC stabilizes; can be omitted if too slow
-    // delay(1);
+    // heltec_delay(1);
   }
   digitalWrite(ADC_Ctrl, FET_DISCONNECT);
 
@@ -3004,7 +3095,6 @@ server.on("/battery", HTTP_GET, [](AsyncWebServerRequest* request) {
               + ",\"percentage\":" + String(cachedBatteryPercentage) + "}";
   request->send(200, "application/json", json);
 });
-
 }
 
 void updateMeshData() {
