@@ -10,7 +10,7 @@
         <p>Each device will automatically pair with other devices nearby and act as relays. The more relays/nodes the more distance and reliability.</p>
         <p>When connected to WiFi via a mobile device, open your browser and go to <a href="http://mesh.local">http://mesh.local</a> to start.</p>
         <p>Setup is easy! Just power up your device after flashing, and you're good to go.</p>
-        <p>It is recommended to use a Heltec V3 v3.1 or v3.2 LoRa device and connect it to an external antenna for longer range, although an external antenna is not required if many users are nearby on the same network.</p>
+        <p>It is recommended to use a Heltec v3 v3.1 or v3.2 LoRa device and connect it to an external antenna for longer range, although an external antenna is not required if many users are nearby on the same network.</p>
         <p>Each device on the mesh acts as a relay, so any messages sent will relay through all connected devices.</p>
         <p>You can purchase a Heltec V3 LoRa (868) device from the link below:</p>
             <a href="https://www.amazon.co.uk/Module-Device-Antenna-Protection-Interface/dp/B0DP4L4LFD/ref=asc_df_B0DP4KWT5V?mcid=f91aa337895932af880d64e9bba921be&hvocijid=437266569732569608-B0DP4KWT5V-&hvexpln=74&tag=googshopuk-21&linkCode=df0&hvadid=696285193871&hvpos=&hvnetw=g&hvrand=437266569732569608&hvpone=&hvptwo=&hvqmt=&hvdev=c&hvdvcmdl=&hvlocint=&hvlocphy=1006643&hvtargid=pla-2281435176698&gad_source=1&th=1">Buy Heltec V3 Complete Kit Amazon</a>
