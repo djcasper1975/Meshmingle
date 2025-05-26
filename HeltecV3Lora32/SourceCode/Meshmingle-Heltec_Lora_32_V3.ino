@@ -22,7 +22,7 @@
 //added settings page we can now set wifi ssid and password and select region which auto dissables duty cycle for usa.
 //
 ////////////////////////////////////////////////////////////////////////
-// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEE //
+// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
 // M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
 // M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
