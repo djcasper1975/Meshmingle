@@ -1,5 +1,5 @@
-//Test v1.00.032 
-//26-05-2025
+//Test v1.00.033 
+//27-05-2025
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -20,6 +20,8 @@
 //changed delay to heltec_delay now the other button powers the unit on and off yippeeee
 //Added a battery cell beside the title on oled screen.
 //added settings page we can now set wifi ssid and password and select region which auto dissables duty cycle for usa.
+//Fixed header links.
+//Added wifi channel to settings page
 //
 ////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
@@ -51,12 +53,12 @@
 #include <DNSServer.h>
 #include <Wire.h>
 #include <esp_task_wdt.h> // Watchdog timer library
-#include <esp_wifi.h>             // for esp_wifi_ap_get_sta_list()
+#include <esp_wifi.h>     // for esp_wifi_ap_get_sta_list()
 #include <vector>         // For handling list of messages and our queue
 #include <map>            // For unified retransmission tracking
 #include <RadioLib.h>     //7.1.2
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
-#include <Preferences.h>    // ← add this
+#include <Preferences.h>  
 #include "settings_feature.h"
 
 // ── Battery monitoring ───────────────────────────────────
@@ -64,10 +66,7 @@
 #define ADC_Ctrl   37   // GPIO37 drives the FET gate
 
 // Meshmingle Parameters
-//#define MESH_SSID "meshmingle.co.uk"
-//#define MESH_PASSWORD ""  //WARNING!! If you have set this and then unset it and reflash you must do FULL ERASE FIRST.
 #define MESH_PORT 5555
-#define MESH_CHANNEL 3     // <— add your chosen channel here (1–13 for 2.4 GHz)
 
 // LoRa Parameters
 //#define MESH_SSID     cfg_ssid.c_str()  //change default values in settings_feature.cpp
@@ -1086,10 +1085,10 @@ void setup() {
           cfg_pass.c_str(),
           MESH_PORT,
           WIFI_AP_STA,
-          MESH_CHANNEL);
+          cfg_channel);
   bypassDutyCycle = cfg_duty_override;
   heltec_setup();
-  Serial.println("Initializing LoRa radio...");
+  Serial.printf(">> Loaded mesh/Wi-Fi channel: %u\n", cfg_channel);
   heltec_led(0);
 #ifdef HELTEC_V3
   // (nothing special for V3)
@@ -1136,7 +1135,7 @@ void setup() {
 
   radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF);
   heltec_delay(2000);
-  WiFi.softAP(cfg_ssid.c_str(), cfg_pass.c_str());   // if you keep a manual Soft-AP
+  WiFi.softAP(cfg_ssid.c_str(), cfg_pass.c_str(), cfg_channel);   // if you keep a manual Soft-AP
   //WiFi.softAP(MESH_SSID, MESH_PASSWORD);  // removed because we was on ch1 then 3
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.setSleep(false);
@@ -1525,7 +1524,7 @@ void loop() {
 
 void initMesh() {
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-  mesh.init(cfg_ssid.c_str(), cfg_pass.c_str(), MESH_PORT, WIFI_AP_STA, MESH_CHANNEL);
+  mesh.init(cfg_ssid.c_str(), cfg_pass.c_str(), MESH_PORT, WIFI_AP_STA, cfg_channel);
   mesh.onReceive(receivedCallback);
 
   mesh.onChangedConnections([]() {
@@ -2214,7 +2213,7 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="nav-links">
-    <a href="/">Chat</a> | <a href="/metrics">History</a>
+    <a href="/">Chat</a> | <a href="/metrics">RX History</a> | <a href="/txHistory">TX History</a>
   </div>
   <h2>Meshmingle Nodes</h2>
   
@@ -2519,7 +2518,7 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="nav-links">
-    <a href="/nodes">NodeList</a> | <a href="/">Chat</a>
+    <a href="/">Chat</a> | <a href="/nodes">NodeList</a> | <a href="/txHistory">TX History</a>
   </div>
   <h2>LoRa 24hr RX History</h2>
   <div class="node-id" id="nodeIdDisplay">Node ID: Loading...</div>
@@ -2609,7 +2608,7 @@ const char txHistoryPageHtml[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="nav-links">
-    <a href="/">Chat</a> | <a href="/nodes">Nodes</a> | <a href="/metrics">History</a>
+    <a href="/">Chat</a> | <a href="/nodes">Nodes</a> | <a href="/metrics">RX History</a>
   </div>
   <h2>Lora 24hr TX History</h2>
   <div id="historyContainer"></div>
@@ -2660,7 +2659,7 @@ const char clientsPageHtml[] PROGMEM = R"rawliteral(
   <div class="nav-links">
     <a href="/">Chat</a>
     <a href="/nodes">Nodes</a>
-    <a href="/clients">Clients</a>
+    <a href="/metrics">RX History</a>
   </div>
   <h2>All Clients (Past &amp; Present)</h2>
   <ul id="macList"></ul>
@@ -2970,7 +2969,7 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
         "<div class='nav-links'>"
         "<a href='/'>Chat</a>"
         "<a href='/nodes'>All Nodes</a>"
-        "<a href='/metrics'>History</a>"
+        "<a href='/metrics'>RX History</a>"
         "</div>"
         "<h2>LoRa Node Details</h2>"
         "<p style='text-align:center;'>Select a LoRa node to see metrics and messages.</p>"
@@ -3020,7 +3019,7 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
         "<div class='nav-links'>"
         "<a href='/'>Chat</a>"
         "<a href='/nodes'>Node List</a>"
-        "<a href='/metrics'>History</a>"
+        "<a href='/metrics'>RX History</a>"
         "</div>";
       html += "<h2>LoRa Node: " + nodeId + "</h2>";
       if (!found) {
