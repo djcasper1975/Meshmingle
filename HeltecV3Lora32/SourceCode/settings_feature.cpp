@@ -1,20 +1,3 @@
-/*
-   ********************** Meshmingle — SETTINGS FEATURE (v6: password rules) **********************
-   What’s new in v6
-   ────────────────
-   • The Wi‑Fi password field now enforces **8–63 printable ASCII characters** client‑side
-     *and* server‑side.
-   • If a bad password is submitted the server replies 400 with a helpful message instead
-     of silently accepting it.
-   • Everything else (EU/USA region dropdown, friendly reboot page) stays the same.
-
-   Integration reminder
-   ────────────────────
-       loadConfig();          // BEFORE WiFi / LoRa begin()
-       initServer();          // your existing call
-       setupSettingsRoutes(); // *AFTER* initServer();
-*/
-
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
 
@@ -27,6 +10,7 @@ String  cfg_ssid          = "meshmingle.co.uk";
 String  cfg_pass          = "";
 float   cfg_freq_mhz      = 869.4000;
 bool    cfg_duty_override = false;
+uint8_t cfg_channel       = 3;
 
 void loadConfig() {
   settings.begin("config", false);
@@ -34,21 +18,24 @@ void loadConfig() {
   cfg_pass          = settings.getString("pass",  cfg_pass);
   cfg_freq_mhz      = settings.getFloat ("freq",  cfg_freq_mhz);
   cfg_duty_override = settings.getBool  ("duty",  cfg_duty_override);
+  cfg_channel       = settings.getUChar ("channel", cfg_channel);
   settings.end();
 }
 
-void saveConfig(const String &ssid, const String &pass, float freq, bool dutyOvrd) {
+void saveConfig(const String &ssid, const String &pass, float freq, bool dutyOvrd, uint8_t channel) {
   settings.begin("config", false);
   settings.putString("ssid",  ssid);
   settings.putString("pass",  pass);
   settings.putFloat ("freq",  freq);
   settings.putBool  ("duty",  dutyOvrd);
+  settings.putUChar("channel", channel);
   settings.end();
 
   cfg_ssid          = ssid;
   cfg_pass          = pass;
   cfg_freq_mhz      = freq;
   cfg_duty_override = dutyOvrd;
+  cfg_channel       = channel;
 }
 
 /************************************* HTML *******************************************/
@@ -67,6 +54,7 @@ const char settingsPageHtml[] PROGMEM = R"rawliteral(
 </head><body>
   <div class="banner %ERRCLS%">%MSG%</div>
   <h2>Device settings</h2>
+  <small>All mesh nodes must use the same WiFi Details.</small>
   <form action="/saveSettings" method="post">
     <label>WiFi name (SSID)
       <input name="ssid" value="%SSID%" maxlength="32" required>
@@ -76,6 +64,9 @@ const char settingsPageHtml[] PROGMEM = R"rawliteral(
              pattern="[\\x20-\\x7E]{0,63}"
              placeholder="leave blank for open network"
              title="Leave blank for open network, or 8 to 63 characters">
+    </label>
+    <label>WiFi Channel (1 to 13)
+      <input name="channel" type="number" min="1" max="13" value="%CHAN%" required>
     </label>
     <label>Region (sets legal LoRa frequency and duty cycle)
       <select name="region">
@@ -134,6 +125,7 @@ void setupSettingsRoutes() {
     bool isUSA = (cfg_freq_mhz > 900.0f);
     page.replace("%EUSEL%", isUSA ? "" : " selected");
     page.replace("%USSEL%", isUSA ? " selected" : "");
+    page.replace("%CHAN%",  String(cfg_channel));
 
     bool saved = req->hasParam("saved");
     bool err   = req->hasParam("err");
@@ -160,7 +152,10 @@ void setupSettingsRoutes() {
     float newFreq = (region == "USA") ? 902.0000f : 869.4000f;
     bool  newDuty = (region == "USA");
 
-    saveConfig(nSsid, nPass, newFreq, newDuty);
+    uint8_t newChan = constrain(
+      req->getParam("channel", true)->value().toInt(), 1, 13
+    );
+    saveConfig(nSsid, nPass, newFreq, newDuty, newChan);
     req->redirect("/settings?saved=1");
   });
 
