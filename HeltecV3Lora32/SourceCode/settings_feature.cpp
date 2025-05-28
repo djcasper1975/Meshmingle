@@ -77,8 +77,8 @@ const char settingsPageHtml[] PROGMEM = R"rawliteral(
              placeholder="leave blank for open network"
              title="Leave blank for open network, or 8 to 63 characters">
     </label>
-    <label>WiFi Channel (1 to 13)
-      <input name="channel" type="number" min="1" max="13" value="%CHAN%" required>
+    <label>WiFi Channel
+      <select name="channel">%CHAN_OPTIONS%</select>
     </label>
     <label>Wi-Fi TX Power
       <select name="wifi_power">
@@ -149,21 +149,36 @@ static bool validPassword(const String &pw){
 }
 
 void setupSettingsRoutes() {
-  // serve settings form
+  // ── GET /settings ───────────────────────────────────────────────
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
     String page = FPSTR(settingsPageHtml);
+    // SSID / PASS / REGION / LORA_ON/OFF banners…
     page.replace("%SSID%", cfg_ssid);
     page.replace("%PASS%", cfg_pass);
-
     bool isUSA = (cfg_freq_mhz > 900.0f);
     page.replace("%EUSEL%", isUSA ? "" : " selected");
     page.replace("%USSEL%", isUSA ? " selected" : "");
-    page.replace("%CHAN%",  String(cfg_channel));
     page.replace("%LORA_ON%",  cfg_lora_enabled ? "selected" : "");
     page.replace("%LORA_OFF%", cfg_lora_enabled ? ""         : "selected");
 
-    // Generate LoRa power options (2–22 dBm)
-    String loraOptions = "";
+    // 1) Wi-Fi CHANNEL selector (1–13)
+    String chanOptions;
+    for(uint8_t c = 1; c <= 13; c++) {
+      chanOptions += "<option value=\"" + String(c) + "\"";
+      if(c == cfg_channel) chanOptions += " selected";
+      chanOptions += ">Ch " + String(c) + "</option>";
+    }
+    page.replace("%CHAN_OPTIONS%", chanOptions);
+
+    // 2) Wi-Fi POWER selector
+    page.replace("%WIFI19%", cfg_wifi_power==WIFI_POWER_19_5dBm ? "selected":"");
+    page.replace("%WIFI17%", cfg_wifi_power==WIFI_POWER_17dBm   ? "selected":"");
+    page.replace("%WIFI15%", cfg_wifi_power==WIFI_POWER_15dBm   ? "selected":"");
+    page.replace("%WIFI13%", cfg_wifi_power==WIFI_POWER_13dBm   ? "selected":"");
+    page.replace("%WIFI11%", cfg_wifi_power==WIFI_POWER_11dBm   ? "selected":"");
+
+    // 3) LoRa POWER selector (2–22)
+    String loraOptions;
     for(uint8_t p = 2; p <= 22; p++) {
       loraOptions += "<option value=\"" + String(p) + "\"";
       if(p == cfg_lora_power) loraOptions += " selected";
@@ -171,34 +186,37 @@ void setupSettingsRoutes() {
     }
     page.replace("%LORAPWR_OPTIONS%", loraOptions);
 
+    // Banner messaging
     bool saved = req->hasParam("saved");
     bool err   = req->hasParam("err");
     page.replace("%ERRCLS%", err ? "error" : "");
     page.replace("%BANNER%", (saved||err) ? "block" : "none");
     page.replace("%MSG%", err
-      ? "Invalid password leave blank or use 8 63 printable ASCII characters."
-      : "Settings saved reboot to apply.");
-
-    page.replace("%WIFI19%", cfg_wifi_power==WIFI_POWER_19_5dBm ? "selected":"");
-    page.replace("%WIFI17%", cfg_wifi_power==WIFI_POWER_17dBm   ? "selected":"");
-    page.replace("%WIFI15%", cfg_wifi_power==WIFI_POWER_15dBm   ? "selected":"");
-    page.replace("%WIFI13%", cfg_wifi_power==WIFI_POWER_13dBm   ? "selected":"");
-    page.replace("%WIFI11%", cfg_wifi_power==WIFI_POWER_11dBm   ? "selected":"");
+      ? "Invalid password leave blank or use 8 to 63 characters."
+      : "Settings saved. Reboot to apply."
+    );
 
     req->send(200, "text/html", page);
   });
 
-  // handle save
+  // ── POST /saveSettings ───────────────────────────────────────────
   server.on("/saveSettings", HTTP_POST, [](AsyncWebServerRequest *req) {
-    String nSsid  = req->getParam("ssid", true)->value();
-    String nPass  = req->getParam("pass", true)->value();
-    String region = req->getParam("region", true)->value();
+    // Read the six existing fields
+    String nSsid  = req->getParam("ssid",  true)->value();
+    String nPass  = req->getParam("pass",  true)->value();
+    String region = req->getParam("region",true)->value();
+    uint8_t newChan = constrain(req->getParam("channel",true)->value().toInt(), 1, 13);
+    bool    nLora   = (req->getParam("lora",   true)->value() == "1");
+    float   newFreq = (region == "USA") ? 902.0f : 869.4f;
+    bool    newDuty = (region == "USA");
 
-    if(!validPassword(nPass)){
+    // Validate password
+    if(!validPassword(nPass)) {
       req->redirect("/settings?err=1");
       return;
     }
 
+    // Parse Wi-Fi power
     String wv = req->getParam("wifi_power", true)->value();
     wifi_power_t newWifi = WIFI_POWER_19_5dBm;
     if      (wv == "WIFI_POWER_17dBm") newWifi = WIFI_POWER_17dBm;
@@ -206,25 +224,26 @@ void setupSettingsRoutes() {
     else if (wv == "WIFI_POWER_13dBm") newWifi = WIFI_POWER_13dBm;
     else if (wv == "WIFI_POWER_11dBm") newWifi = WIFI_POWER_11dBm;
 
+    // Parse LoRa power
     uint8_t newLoRa = constrain(
       req->getParam("lora_power", true)->value().toInt(),
       2, 22
     );
 
-    float newFreq = (region == "USA") ? 902.0000f : 869.4000f;
-    bool  newDuty = (region == "USA");
-
-    uint8_t newChan = constrain(
-      req->getParam("channel", true)->value().toInt(), 1, 13
+    // Save all eight settings
+    saveConfig(
+      nSsid, nPass,
+      newFreq, newDuty,
+      newChan, nLora,
+      newWifi, newLoRa
     );
-    String loraVal = req->getParam("lora", true)->value();  // "1" or "0"
-    bool   nLora   = (loraVal == "1");
-    saveConfig(nSsid, nPass, newFreq, newDuty, newChan, nLora, newWifi, newLoRa);
-    req->redirect("/settings?saved=1");
-  });
 
-  // reboot endpoint remains unchanged
-  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *req){
+    // Redirect to show “saved” banner
+    req->redirect("/settings?saved=1");
+  });  // <-- IMPORTANT: close the POST handler here
+
+  // ── POST /reboot ─────────────────────────────────────────────────
+  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *req) {
     req->send_P(200, "text/html", rebootPageHtml);
     delay(400);
     ESP.restart();
