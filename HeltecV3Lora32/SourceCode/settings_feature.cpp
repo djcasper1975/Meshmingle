@@ -113,6 +113,30 @@ const char settingsPageHtml[] PROGMEM = R"rawliteral(
 </body></html>
 )rawliteral";
 
+// Confirmation page shown while the device restarts
+const char rebootPageHtml[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+  <meta http-equiv="refresh" content="20; url=/">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Rebooting</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;text-align:center;padding-top:22vh;}
+    h1{font-size:1.9em;margin-bottom:.4em;}
+    p{color:#555;line-height:1.4em;max-width:320px;margin:0 auto;}
+  </style>
+  <script>
+    const ping = () => fetch('/')
+        .then(r=>{if(r.ok) window.location.replace('/');})
+        .catch(()=>{});
+    setInterval(ping, 3000);
+  </script>
+</head><body>
+  <h1>Rebooting</h1>
+  <p>Your node is restarting.<br>This page will load the main interface automatically once its online or another mesh node.</p>
+</body></html>
+)rawliteral";
+
+
 /********************************* WEB ROUTES ****************************************/
 static bool validPassword(const String &pw){
   // Allow blank password for an open network. Otherwise enforce 8–63 printable ASCII.
