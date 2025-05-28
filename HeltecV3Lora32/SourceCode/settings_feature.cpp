@@ -1,6 +1,6 @@
 #include <Preferences.h>
 #include <ESPAsyncWebServer.h>
-
+#include <WiFi.h>  // for WIFI_POWER_xxx constants
 extern AsyncWebServer server;  // declared in main sketch
 
 /********************************* PERSISTENT CONFIG *********************************/
@@ -11,6 +11,9 @@ String  cfg_pass          = "";
 float   cfg_freq_mhz      = 869.4000;
 bool    cfg_duty_override = false;
 uint8_t cfg_channel       = 3;
+bool cfg_lora_enabled = true;   // default = On
+uint8_t cfg_wifi_power = WIFI_POWER_19_5dBm;
+uint8_t cfg_lora_power = 22;  // or your existing default, e.g. 22
 
 void loadConfig() {
   settings.begin("config", false);
@@ -19,16 +22,22 @@ void loadConfig() {
   cfg_freq_mhz      = settings.getFloat ("freq",  cfg_freq_mhz);
   cfg_duty_override = settings.getBool  ("duty",  cfg_duty_override);
   cfg_channel       = settings.getUChar ("channel", cfg_channel);
+  cfg_lora_enabled  = settings.getBool ("lora",    cfg_lora_enabled);
+  cfg_wifi_power = (wifi_power_t)settings.getUChar("wifi_pwr", cfg_wifi_power);
+  cfg_lora_power = settings.getUChar   ("lora_pwr", cfg_lora_power);
   settings.end();
 }
 
-void saveConfig(const String &ssid, const String &pass, float freq, bool dutyOvrd, uint8_t channel) {
+void saveConfig(const String &ssid, const String &pass, float freq, bool dutyOvrd, uint8_t channel, bool loraEn, wifi_power_t wifiPower, uint8_t loraPower) {
   settings.begin("config", false);
   settings.putString("ssid",  ssid);
   settings.putString("pass",  pass);
   settings.putFloat ("freq",  freq);
   settings.putBool  ("duty",  dutyOvrd);
   settings.putUChar("channel", channel);
+  settings.putBool ("lora",    loraEn);
+  settings.putUChar("wifi_pwr", wifiPower);
+  settings.putUChar("lora_pwr", loraPower);
   settings.end();
 
   cfg_ssid          = ssid;
@@ -36,6 +45,9 @@ void saveConfig(const String &ssid, const String &pass, float freq, bool dutyOvr
   cfg_freq_mhz      = freq;
   cfg_duty_override = dutyOvrd;
   cfg_channel       = channel;
+  cfg_lora_enabled = loraEn;
+  cfg_wifi_power = wifiPower;
+  cfg_lora_power = loraPower;
 }
 
 /************************************* HTML *******************************************/
@@ -68,11 +80,28 @@ const char settingsPageHtml[] PROGMEM = R"rawliteral(
     <label>WiFi Channel (1 to 13)
       <input name="channel" type="number" min="1" max="13" value="%CHAN%" required>
     </label>
-    <label>Region (sets legal LoRa frequency and duty cycle)
+  <label>Wi-Fi TX Power
+    <select name="wifi_power">
+      <option value="WIFI_POWER_19_5dBm" %WIFI19%>19.5 dBm</option>
+      <option value="WIFI_POWER_17dBm"   %WIFI17%>17   dBm</option>
+      <option value="WIFI_POWER_15dBm"   %WIFI15%>15   dBm</option>
+      <option value="WIFI_POWER_13dBm"   %WIFI13%>13   dBm</option>
+      <option value="WIFI_POWER_11dBm"   %WIFI11%>11   dBm</option>
+    </select>
+  </label>
+        <label>Region (sets legal LoRa frequency and duty cycle)
       <select name="region">
         <option value="EU"%EUSEL%>EU / UK</option>
         <option value="USA"%USSEL%>USA</option>
       </select>
+    </label>
+    <label for="lora">LoRa Radio:</label>
+  <select name="lora" id="lora">
+    <option value="1" %LORA_ON%>On</option>
+    <option value="0" %LORA_OFF%>Off</option>
+  </select>
+    <label>LoRa TX Power
+  <input name="lora_power" type="number" min="2" max="22" value="%LORAPWR%" required>
     </label>
     <button type="submit">Save</button>
   </form>
@@ -86,7 +115,7 @@ const char rebootPageHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
   <meta http-equiv="refresh" content="20; url=/">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Rebooting…</title>
+  <title>Rebooting</title>
   <style>
     body{font-family:Arial,Helvetica,sans-serif;text-align:center;padding-top:22vh;}
     h1{font-size:1.9em;margin-bottom:.4em;}
@@ -126,6 +155,8 @@ void setupSettingsRoutes() {
     page.replace("%EUSEL%", isUSA ? "" : " selected");
     page.replace("%USSEL%", isUSA ? " selected" : "");
     page.replace("%CHAN%",  String(cfg_channel));
+    page.replace("%LORA_ON%",  cfg_lora_enabled ? "selected" : "");
+    page.replace("%LORA_OFF%", cfg_lora_enabled ? ""         : "selected");
 
     bool saved = req->hasParam("saved");
     bool err   = req->hasParam("err");
@@ -134,6 +165,12 @@ void setupSettingsRoutes() {
     page.replace("%MSG%", err
       ? "Invalid password leave blank or use 8 63 printable ASCII characters."
       : "Settings saved reboot to apply.");
+page.replace("%WIFI19%", cfg_wifi_power==WIFI_POWER_19_5dBm ? "selected":"");
+page.replace("%WIFI17%", cfg_wifi_power==WIFI_POWER_17dBm   ? "selected":"");
+page.replace("%WIFI15%", cfg_wifi_power==WIFI_POWER_15dBm   ? "selected":"");
+page.replace("%WIFI13%", cfg_wifi_power==WIFI_POWER_13dBm   ? "selected":"");
+page.replace("%WIFI11%", cfg_wifi_power==WIFI_POWER_11dBm   ? "selected":"");
+    page.replace("%LORAPWR%", String(cfg_lora_power));
 
     req->send(200, "text/html", page);
   });
@@ -149,16 +186,29 @@ void setupSettingsRoutes() {
       return;
     }
 
+  String wv = req->getParam("wifi_power", true)->value();
+  wifi_power_t newWifi = WIFI_POWER_19_5dBm;
+  if      (wv == "WIFI_POWER_17dBm") newWifi = WIFI_POWER_17dBm;
+  else if (wv == "WIFI_POWER_15dBm") newWifi = WIFI_POWER_15dBm;
+  else if (wv == "WIFI_POWER_13dBm") newWifi = WIFI_POWER_13dBm;
+  else if (wv == "WIFI_POWER_11dBm") newWifi = WIFI_POWER_11dBm;
+
+  uint8_t newLoRa = constrain(
+    req->getParam("lora_power", true)->value().toInt(),
+    2, 22
+  );
+
     float newFreq = (region == "USA") ? 902.0000f : 869.4000f;
     bool  newDuty = (region == "USA");
 
     uint8_t newChan = constrain(
       req->getParam("channel", true)->value().toInt(), 1, 13
     );
-    saveConfig(nSsid, nPass, newFreq, newDuty, newChan);
+    String loraVal = req->getParam("lora", true)->value();  // "1" or "0"
+   bool   nLora   = (loraVal == "1");
+    saveConfig(nSsid, nPass, newFreq, newDuty, newChan, nLora, newWifi, newLoRa);
     req->redirect("/settings?saved=1");
   });
-
   // reboot endpoint
   server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *req){
     req->send_P(200, "text/html", rebootPageHtml);
