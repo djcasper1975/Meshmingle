@@ -1,5 +1,15 @@
-//Test v1.00.033 
-//27-05-2025
+////////////////////////////////////////////////////////////////////////
+// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
+// MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
+// M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
+// M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
+// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
+////////////////////////////////////////////////////////////////////////
+//
+//Test v1.00.033
+//28-05-2025
+//
+//
 //
 //YOU MUST UPDATE ALL YOUR NODES FROM LAST VERSION OR YOU WONT SEE RELAYS ANYMORE!!!!!
 //
@@ -21,17 +31,13 @@
 //Added a battery cell beside the title on oled screen.
 //added settings page we can now set wifi ssid and password and select region which auto dissables duty cycle for usa.
 //Fixed header links.
-//Added wifi channel to settings page
+//Added wifi Channel to settings page
+//Added Wifi TX Power to setings page.
+//Added Lora TX Power to setings page.
 //
-////////////////////////////////////////////////////////////////////////
-// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
-// MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
-// M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
-// M    M  E          S  H   H  M    M  I  N  NN  G   G  L      E     //
-// M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
-////////////////////////////////////////////////////////////////////////
 //
-// Uncomment to enable Heltec V3-specific logic
+//
+//Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
 //#define HELTEC_V3
 
 #ifdef HELTEC_V3
@@ -69,15 +75,12 @@
 #define MESH_PORT 5555
 
 // LoRa Parameters
-//#define MESH_SSID     cfg_ssid.c_str()  //change default values in settings_feature.cpp
-//#define MESH_PASSWORD cfg_pass.c_str()  //change default values in settings_feature.cpp
+
 #define PAUSE 5400000  //Required timeout Time for dutycycle (54 Min)
-//#define FREQUENCY 869.4000 //We are currently using an EU868 Lora Frequency that requires the full band 869.4000 - 869.6500 only single channel use supported for now.
 #define BANDWIDTH 250.0 
 #define SPREADING_FACTOR 11 
 #define TRANSMIT_POWER 22 //This is max power for This Boards EU868 Config.
 #define CODING_RATE 8 
-
 
 // Some Global Variables
 bool enableRxBoost = true; //enable or disable RX Boost Mode
@@ -1119,25 +1122,30 @@ void setup() {
 
   showScrollingMonospacedAsciiArt();
   Serial.println("Setup complete. Starting battery readings...");
-
+  Serial.printf(">>> LoRa enabled? %s\n", cfg_lora_enabled ? "YES" : "NO");
+// LoRa initialization wrapped in the new toggle
+if (cfg_lora_enabled) {
+  Serial.println("[LoRa] Initializing radio...");
   RADIOLIB_OR_HALT(radio.begin());
   radio.setDio1Action(onRadioRx);
-  if(enableRxBoost) {
-    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(true));
-  } else {
-    RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(false));
-  }
+
+  // collapse the two branches into one call
+  RADIOLIB_OR_HALT(radio.setRxBoostedGainMode(enableRxBoost));
+
   RADIOLIB_OR_HALT(radio.setFrequency(cfg_freq_mhz));
   RADIOLIB_OR_HALT(radio.setBandwidth(BANDWIDTH));
   RADIOLIB_OR_HALT(radio.setSpreadingFactor(SPREADING_FACTOR));
   RADIOLIB_OR_HALT(radio.setCodingRate(CODING_RATE));
-  RADIOLIB_OR_HALT(radio.setOutputPower(TRANSMIT_POWER));
-
+  RADIOLIB_OR_HALT(radio.setOutputPower(cfg_lora_power));
   radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF);
+}else{
+  Serial.println("[LoRa] Disabled by configuration.");
+}
+
   heltec_delay(2000);
   WiFi.softAP(cfg_ssid.c_str(), cfg_pass.c_str(), cfg_channel);   // if you keep a manual Soft-AP
   //WiFi.softAP(MESH_SSID, MESH_PASSWORD);  // removed because we was on ch1 then 3
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setTxPower(cfg_wifi_power);
   WiFi.setSleep(false);
   mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
   mesh.onReceive(receivedCallback);
@@ -1239,6 +1247,7 @@ void loop() {
     nextAggregatedHeartbeatTime = millis() + aggregatedHeartbeatInterval + global_jitter_offset;
   }
 
+if (cfg_lora_enabled) {
   if (rxFlag) {
     rxFlag = false;
     String message;
@@ -1508,7 +1517,7 @@ void loop() {
   if (!loraTransmissionQueue.empty() && millis() >= loRaTransmitDelay) {
     transmitWithDutyCycle(loraTransmissionQueue.front());
   }
-
+}
   updateMeshData();
   displayCarousel();
   dnsServer.processNextRequest();
@@ -2840,13 +2849,16 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     addMessage(getCustomNodeId(getNodeId()), messageID, senderName, target, newMessage, "[LoRa]", relayID);
     Serial.printf("[LoRa Tx] Adding message: %s\n", constructedMessage.c_str());
 
-    messageTransmissions[messageID].origin = ORIGIN_WIFI;
-    // Mark that WiFi relay is pending – it will be transmitted after LoRa succeeds.
+  if (cfg_lora_enabled) {
+    // still queue it for LoRa → then Wi-Fi
+    messageTransmissions[messageID].origin          = ORIGIN_LORA;
     messageTransmissions[messageID].pendingWiFiRelay = true;
-
-    // Schedule LoRa transmission for the message.
-    // For WiFi, no measured rssi is available so we use the default (-100)
     scheduleLoRaTransmission(constructedMessage, -100);
+  }else{
+    // LoRa is off, so just send it over Wi-Fi right now:
+    Serial.println("[WiFi Tx] LoRa disabled, broadcasting immediately");
+    transmitViaWiFi(constructedMessage);
+}
     request->redirect("/");
   });
 
