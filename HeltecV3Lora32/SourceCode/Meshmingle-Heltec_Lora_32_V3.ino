@@ -7,7 +7,7 @@
 ////////////////////////////////////////////////////////////////////////
 //
 //Test v1.00.034
-//28-05-2025
+//29-05-2025
 //
 //
 //
@@ -19,7 +19,7 @@
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
 //Added channel number for wifi settings.
-//Fixed channel issues we now have 1 node auto assign
+//Fixed channel issues we now have 1 node auto assign root
 //added battery monitor its not the best but its something for now.(heltec sux for this)
 //Added 0% actual voltage
 //Added battery cache instead of refreshing readings at will.
@@ -34,7 +34,7 @@
 //Added wifi Channel to settings page
 //Added Wifi TX Power to setings page.
 //Added Lora TX Power to setings page.
-//
+//edded a loop to start rx every 10 min
 //
 //
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
@@ -86,6 +86,13 @@
 bool enableRxBoost = true; //enable or disable RX Boost Mode
 bool sendAggregatedHeartbeats = false;  //0 hop nodelist sharing. Theres issues with this right now!!!!
 bool bypassDutyCycle = false;  // Enable or Disable DutyCycle (For Non EU Use ONLY!!!)
+
+String ourApMac;          // upper-case, colon-separated
+
+// --- LoRa RX keep-alive ---
+static unsigned long lastRxKick   = 0;
+const  unsigned long RX_KICK_MS   = 600000UL;   // 10 min
+const  unsigned long RX_IDLE_CAP  = 3000UL;     // avoid kicking while busy
 
 // Calibration: actual vs raw based on 3.7 v 1100mah 4.07w Lithium Battery
 const float measuredV  = 4.20f;   // battery full
@@ -163,12 +170,16 @@ static String macToString(const uint8_t* mac) {
   return String(buf);
 }
 
+
 // Pull the current AP station list and add to our master set
 void updateClientList() {
   wifi_sta_list_t staList;
   esp_wifi_ap_get_sta_list(&staList);
+
   for (int i = 0; i < staList.num; i++) {
-    clientMacs.insert(macToString(staList.sta[i].mac));
+    String mac = macToString(staList.sta[i].mac);
+    if (mac == ourApMac) continue;   //  <<< skip ourselves
+    clientMacs.insert(mac);
   }
 }
 
@@ -222,6 +233,28 @@ void recalcCalibration() {
   Serial.printf("Recalculated mapping: Vout = %.3f·Vraw + %.3f\n",
                 calSlope, calIntercept);
 }
+
+// put this just below the existing recalcCalibration() call
+void primeBatteryCacheCalibrated() {
+  float rawV = readBatteryVoltage() / 1000.0f;
+
+  // Avoid divide-by-zero if we don’t have a low yet
+  float span = vMaxRaw - vMinRaw;
+  if (span < 0.05f) {              // never discharged yet → guess 3.20 V
+    vMinRaw = rawV;                // treat current value as min for now
+    span    = 0.05f;               // 50 mV fake span keeps maths sane
+  }
+
+  float calV = nominalVmin +
+               (rawV - vMinRaw) * (nominalVmax - nominalVmin) / span;
+
+  calV = constrain(calV, nominalVmin, nominalVmax);
+
+  cachedBatteryVoltage    = calV;
+  cachedBatteryPercentage = constrain(
+      int((calV - nominalVmin) / (nominalVmax - nominalVmin) * 100), 0, 100);
+}
+
 
 void resetDutyCycle() {
     cumulativeTxTime = 0;
@@ -435,6 +468,7 @@ void cleanupTransmissionHistory() {
   }
 }
 
+
 // --- Helper functions for dynamic slot calculation ---
 // getTxDuration: returns the measured TX duration in ms; if not available, returns preset 3000 ms.
 unsigned long getTxDuration(String message) {
@@ -582,6 +616,7 @@ String determineTxType(const String &message) {
     }
   }
 }
+
 
 // --- scheduleLoRaTransmission() updated to parse 6 fields ---
 // Expected format: messageID|originatorID|sender|recipient|content|relayID|CRC
@@ -1144,6 +1179,8 @@ if (cfg_lora_enabled) {
 
   heltec_delay(2000);
   WiFi.softAP(cfg_ssid.c_str(), cfg_pass.c_str(), cfg_channel);   // if you keep a manual Soft-AP
+  ourApMac = WiFi.softAPmacAddress();
+  ourApMac.toUpperCase();            // so it matches macToString()
   //WiFi.softAP(MESH_SSID, MESH_PASSWORD);  // removed because we was on ch1 then 3
   WiFi.setTxPower(cfg_wifi_power);
   WiFi.setSleep(false);
@@ -1176,19 +1213,15 @@ if (cfg_lora_enabled) {
   nextAggregatedHeartbeatTime = millis() + aggregatedHeartbeatInterval + global_jitter_offset;
 
 // Prime the battery cache immediately
-lastBatteryCacheUpdate = millis();
-uint16_t mV = readBatteryVoltage();
-cachedBatteryVoltage = mV / 1000.0f;
-cachedBatteryPercentage = constrain(
-  int((cachedBatteryVoltage - measuredV0) / (measuredV - measuredV0) * 100),
-  0, 100
-);
+lastBatteryCacheUpdate = millis() - batteryCacheInterval;
+
 // ——— Persistent raw min/max init ———
 prefs.begin("battery", false);
 // default vMinRaw to the measured empty voltage, vMaxRaw to the measured full voltage
 vMinRaw = prefs.getFloat("vMinRaw", measuredV0);
 vMaxRaw = prefs.getFloat("vMaxRaw", measuredV);
 recalcCalibration();
+primeBatteryCacheCalibrated();
 Serial.printf("Loaded vMinRaw: %.3f V, vMaxRaw: %.3f V\n", vMinRaw, vMaxRaw);
 
 }
@@ -1197,6 +1230,15 @@ void loop() {
   esp_task_wdt_reset();
   heltec_loop();
   mesh.update();
+    // ——— RX keeper ———
+if (cfg_lora_enabled
+    && (millis() - lastRxKick > RX_KICK_MS)) {
+  radio.standby();                                   // drop out of any half-state
+  radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF);
+  lastRxKick = millis();
+  Serial.println("[RX-Kick] SX1262 receiver refreshed");
+}
+
   // ——— cache & calibrate battery every 60 seconds ———
   if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
     lastBatteryCacheUpdate = millis();
@@ -2643,21 +2685,22 @@ const char clientsPageHtml[] PROGMEM = R"rawliteral(
     .nav-links a:hover { text-decoration:underline; }
   </style>
   <script>
-    function fetchClients() {
-      fetch('/clientsData')
-        .then(r => r.json())
-        .then(data => {
-          const ul = document.getElementById('macList');
-          ul.innerHTML = '';
-          data.macs.forEach(mac => {
-            const li = document.createElement('li');
-            li.className = 'mac-item';
-            li.textContent = mac;
-            ul.appendChild(li);
-          });
-        })
-        .catch(console.error);
-    }
+function fetchClients() {
+  fetch('/clientsData')
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById('ourMac').textContent = data.ourMac;  // new
+      const ul = document.getElementById('macList');
+      ul.innerHTML = '';
+      data.macs.forEach(mac => {
+        const li = document.createElement('li');
+        li.className = 'mac-item';
+        li.textContent = mac;
+        ul.appendChild(li);
+      });
+    })
+    .catch(console.error);
+}
     window.onload = function() {
       fetchClients();
       setInterval(fetchClients, 10000);
@@ -2670,11 +2713,12 @@ const char clientsPageHtml[] PROGMEM = R"rawliteral(
     <a href="/nodes">Nodes</a>
     <a href="/metrics">RX History</a>
   </div>
+  <p><strong>Node Mac:</strong> <code id="ourMac"></code></p>   <!-- new line -->
   <h2>All Clients (Past &amp; Present)</h2>
   <ul id="macList"></ul>
-</body>
-</html>
-)rawliteral";
+  </body>
+  </html>
+  )rawliteral";
 
 // --- Helper function to format relative time ---
 String formatRelativeTime(uint64_t ageMs) {
@@ -3097,16 +3141,16 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
 
   // --- JSON endpoint for JS to pull MAC list ---
   server.on("/clientsData", HTTP_GET, [](AsyncWebServerRequest* request){
-    updateClientList();
-    String json = "{\"macs\":[";
-    bool first = true;
-    for (const auto& m : clientMacs) {
-      if (!first) json += ",";
-      json += "\"" + m + "\"";
-      first = false;
-    }
-    json += "]}";
-    request->send(200, "application/json", json);
+  updateClientList();
+  String json = "{\"ourMac\":\"" + ourApMac + "\",\"macs\":[";
+  bool first = true;
+  for (const auto& m : clientMacs) {
+    if (!first) json += ",";
+    json += "\"" + m + "\"";
+    first = false;
+  }
+  json += "]}";
+  request->send(200, "application/json", json);
   });
 
   // —————————————————————————————————————————————————————————————————
