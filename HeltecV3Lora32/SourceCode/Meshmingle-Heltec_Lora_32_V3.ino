@@ -24,7 +24,7 @@
 //Added 0% actual voltage
 //Added battery cache instead of refreshing readings at will.
 //we now calculate empty and full charge and save it for calibration. heltec voltate dividers and batterys all have diff values. hopefully this will be a little better.
-//we need to fully charge the battery until orange light goes OFF. Then let the battery run flat. Now you have a calibrated battery and board. Next we need to solve the charging voltage rise and drop when not.
+//we need to fully charge the battery until orange light goes OFF. Then let the battery run flat. Now you have a calibrated battery and board. 
 //added voltage spike reduction when charging currently at -100mv of each reading so when unplugged we dont drop in charge 10% by unplugging.
 //V3.2 is now default if you want v3 you must define it.
 //changed delay to heltec_delay now the other button powers the unit on and off yippeeee
