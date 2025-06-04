@@ -1,4 +1,4 @@
-////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
 // M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
@@ -6,8 +6,8 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-//Test v1.00.034
-//29-05-2025
+//Test v1.00.035
+//04-06-2025
 //
 //
 //
@@ -18,23 +18,11 @@
 //After Accounting for Heartbeats: 20 sec after boot then every 15 mins thereafter.
 //Per Hour: 136 Max Char messages within the 6-minute (360,000 ms) duty cycle
 //Per Day: 3,296 Max Char messages within the 8,640,000 ms (10% duty cycle) allowance
-//Added channel number for wifi settings.
-//Fixed channel issues we now have 1 node auto assign root
-//added battery monitor its not the best but its something for now.(heltec sux for this)
-//Added 0% actual voltage
-//Added battery cache instead of refreshing readings at will.
-//we now calculate empty and full charge and save it for calibration. heltec voltate dividers and batterys all have diff values. hopefully this will be a little better.
-//we need to fully charge the battery until orange light goes OFF. Then let the battery run flat. Now you have a calibrated battery and board. 
-//added voltage spike reduction when charging currently at -100mv of each reading so when unplugged we dont drop in charge 10% by unplugging.
-//V3.2 is now default if you want v3 you must define it.
-//changed delay to heltec_delay now the other button powers the unit on and off yippeeee
-//Added a battery cell beside the title on oled screen.
-//added settings page we can now set wifi ssid and password and select region which auto dissables duty cycle for usa.
-//Fixed header links.
-//Added wifi Channel to settings page
-//Added Wifi TX Power to setings page.
-//Added Lora TX Power to setings page.
-//edded a loop to start rx every 10 min
+//
+//altered battery calibration again.
+//added perminant node list.
+//fixed bug where nodes are reboot reset message id to 1 and any nodes alreasy relayed those ids wont relay untill you reach 1+ past the id they last sent.
+//another bug where if node reflashed after sending messages relays wont relay because they seen the messssage ids. new solution a nonce at boot.
 //
 //
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
@@ -66,6 +54,7 @@
 #include <set>            // Used for node id count checking all 3 sources of nodes. i.e wifi, direct lora, indirect lora. now add to total node count.
 #include <Preferences.h>  
 #include "settings_feature.h"
+#include "recent_nodes_feature.h"
 
 // ── Battery monitoring ───────────────────────────────────
 #define VBAT_Read  1    // ADC1 channel 1 (divider output)
@@ -106,11 +95,11 @@ float      vMin, vMax;
 const float presetVMin = measuredV;  
 const float presetVMax = measuredV0;
 // how much surface-charge offset to subtract from your peak
-const float calibrationOffset = 0.100f; // 100 mV we minus this value of our max v reading when charging to avoid voltage drop when charger is off and batt full. you can tweek this for more accuracy. or set to 0.0 for none.
+const float calibrationOffset = 0.000f; // this only made things worse by always - value even if battery fully charged. each reading would -
 const float updateThreshold = 0.005f; // 5 mV
 
 // nominal battery endpoints
-const float nominalVmin = 3.20f;
+const float nominalVmin = 3.30f;
 const float nominalVmax = 4.20f;
 
 
@@ -128,6 +117,12 @@ float   cachedBatteryVoltage   = 0.0f;
 int     cachedBatteryPercentage= 0;
 unsigned long lastBatteryCacheUpdate = 0;
 const unsigned long batteryCacheInterval = 60000UL; // 60 s
+
+Preferences bootPrefs;
+uint8_t bootNonce;        // 0-255  →  two hex chars
+
+// ─────────  Message-counter persistence  ──────────
+Preferences msgPrefs;           // NEW  – own NVS namespace
 
 // ---------------------------------------------------------------------
 // NEW: Define an enum to track the origin of each message
@@ -182,6 +177,7 @@ void updateClientList() {
     clientMacs.insert(mac);
   }
 }
+
 
 // ---------------------------------------------------------------------
 // NEW: Relay Log Definitions
@@ -329,9 +325,17 @@ String getCustomNodeId(uint32_t nodeId) {
     return "!M" + hexNodeId;
 }
 
-String generateMessageID(const String& nodeId) {
-  messageCounter++;
-  return nodeId + ":" + String(messageCounter);
+/* -------- new generateMessageID() -------- */
+String generateMessageID(const String& nodeId)
+{
+    messageCounter++;
+    msgPrefs.putULong("last", messageCounter);
+
+    char buf[3];                           // two hex digits + null
+    sprintf(buf, "%02X", bootNonce);       // e.g. “A7”
+
+    // !Mxxxxxx:<2-hex-nonce><counter>
+    return nodeId + ":" + String(buf) + String(messageCounter);
 }
 
 uint16_t crc16_ccitt(const uint8_t *buf, size_t len) {
@@ -1116,9 +1120,10 @@ void sendAggregatedHeartbeat() {
 void onRadioRx() {
   rxFlag = true;
 }
-
+//battery calibration erase
 void setup() {
   loadConfig();
+  loadRecentNodes();   // <-- NEW: keep lifetime list of every LoRa node we’ve seen
   mesh.init(cfg_ssid.c_str(),           // <— from settings_feature
           cfg_pass.c_str(),
           MESH_PORT,
@@ -1212,6 +1217,7 @@ if (cfg_lora_enabled) {
   nextHeartbeatTime = millis() + firstHeartbeatDelayValue + global_jitter_offset;
   nextAggregatedHeartbeatTime = millis() + aggregatedHeartbeatInterval + global_jitter_offset;
 
+
 // Prime the battery cache immediately
 lastBatteryCacheUpdate = millis() - batteryCacheInterval;
 
@@ -1223,6 +1229,25 @@ vMaxRaw = prefs.getFloat("vMaxRaw", measuredV);
 recalcCalibration();
 primeBatteryCacheCalibrated();
 Serial.printf("Loaded vMinRaw: %.3f V, vMaxRaw: %.3f V\n", vMinRaw, vMaxRaw);
+
+if (!prefs.isKey("vMinRaw")) prefs.putFloat("vMinRaw", 5.00f); // unreal high
+if (!prefs.isKey("vMaxRaw")) prefs.putFloat("vMaxRaw", 0.00f); // unreal low
+vMinRaw = prefs.getFloat("vMinRaw");
+vMaxRaw = prefs.getFloat("vMaxRaw");
+
+bootPrefs.begin("boot", false);
+if (!bootPrefs.isKey("nonce")) {          // first run after an ERASE-ALL
+    bootNonce = (uint8_t)esp_random();    // hardware RNG
+    bootPrefs.putUChar("nonce", bootNonce);
+} else {
+    bootNonce = bootPrefs.getUChar("nonce");
+}
+bootPrefs.end();
+
+// ——— Restore monotonic message-counter ———
+msgPrefs.begin("msgcnt", false);              // open NVS namespace
+messageCounter = msgPrefs.getULong("last", 0);
+Serial.printf("Message-counter starts at %lu\n", messageCounter);
 
 }
 
@@ -1239,46 +1264,53 @@ if (cfg_lora_enabled
   Serial.println("[RX-Kick] SX1262 receiver refreshed");
 }
 
-  // ——— cache & calibrate battery every 60 seconds ———
-  if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
-    lastBatteryCacheUpdate = millis();
+// ——— cache & calibrate battery every 60 seconds ———
+if (millis() - lastBatteryCacheUpdate >= batteryCacheInterval) {
+  lastBatteryCacheUpdate = millis();
 
-    // 1) raw divider reading in volts
-    float rawV = readBatteryVoltage() / 1000.0f;
+  /* 1) raw divider reading, volts */
+  const float rawV = readBatteryVoltage() / 1000.0f;
 
-    // 2a) update raw MIN only if it's at least 5 mV below the saved value
-    if (rawV <= vMinRaw - updateThreshold) {
-      vMinRaw = rawV;
-      prefs.putFloat("vMinRaw", vMinRaw);
-      Serial.printf("New vMinRaw (saved): %.3f V\n", vMinRaw);
-    }
+  /* 2) learn new extrema ------------------------------------------ */
+  const float hyst = 0.002f;           // 2 mV noise cushion
 
-    // 2b) update raw MAX (with calibrationOffset) only if it's at least 5 mV above
-    float candidateMax = rawV - calibrationOffset;
-    if (candidateMax >= vMaxRaw + updateThreshold) {
-      vMaxRaw = candidateMax;
-      prefs.putFloat("vMaxRaw", vMaxRaw);
-      Serial.printf("New vMaxRaw (saved): %.3f V\n", vMaxRaw);
-    }
-
-    // 3) map rawV → calibrated [nominalVmin…nominalVmax]
-    float calV = nominalVmin
-               + (rawV - vMinRaw)
-                 * (nominalVmax - nominalVmin)
-                 / (vMaxRaw - vMinRaw);
-    calV = constrain(calV, nominalVmin, nominalVmax);
-
-    // 4) update your displayed/cache values
-    cachedBatteryVoltage    = calV;
-    cachedBatteryPercentage = constrain(
-      int((calV - nominalVmin)
-          / (nominalVmax - nominalVmin)
-          * 100.0f),
-      0, 100
-    );
-    Serial.printf("Cached battery: %.3f V (%d%%)\n",
-                  cachedBatteryVoltage, cachedBatteryPercentage);
+  // LOWEST-ever (no offset)
+  if (rawV < vMinRaw - hyst) {
+    vMinRaw = rawV;
+    prefs.putFloat("vMinRaw", vMinRaw);
+    Serial.printf("New vMinRaw saved: %.3f V\n", vMinRaw);
   }
+
+  // HIGHEST-ever (apply offset before saving!)
+  const float candidateMax = rawV - calibrationOffset;
+  if (candidateMax > vMaxRaw + hyst) {
+    vMaxRaw = candidateMax;
+    prefs.putFloat("vMaxRaw", vMaxRaw);
+    Serial.printf("New vMaxRaw saved: %.3f V (after −%.0fmV)\n",
+                  vMaxRaw, calibrationOffset*1000);
+  }
+
+  /* 3) sanity – make sure span is never silly-small */
+  float span = vMaxRaw - vMinRaw;
+  if (span < 0.05f) span = 0.05f;      // 50 mV minimum
+
+  /* 4) map raw voltage → calibrated voltage */
+  float calV = nominalVmin +
+               (rawV - vMinRaw) *
+               (nominalVmax - nominalVmin) / span;
+
+  calV = constrain(calV, nominalVmin, nominalVmax);
+
+  /* 5) update public cache */
+  cachedBatteryVoltage    = calV;
+  cachedBatteryPercentage = constrain(
+      int((calV - nominalVmin) * 100.0f /
+          (nominalVmax - nominalVmin)),
+      0, 100);
+
+  Serial.printf("Batt: raw=%.3f V  cal=%.3f V  %d %%\n",
+                rawV, calV, cachedBatteryPercentage);
+}
 
   if (millis() >= nextHeartbeatTime) {
     sendHeartbeat();
@@ -1329,6 +1361,7 @@ if (cfg_lora_enabled) {
 
           if (messageWithoutCRC.startsWith("HEARTBEAT|")) {
             String senderNodeId = messageWithoutCRC.substring(strlen("HEARTBEAT|"));
+            addRecentNode(senderNodeId);     // ← NEW – remember the direct LoRa node
             Serial.printf("[LoRa Rx] Heartbeat from %s\n", senderNodeId.c_str());
             int rssi = radio.getRSSI();
             float snr = radio.getSNR();
@@ -1352,72 +1385,81 @@ if (cfg_lora_enabled) {
               Serial.println("[LoRa Rx] Own heartbeat, ignore.");
             }
           }
-          else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-            Serial.printf("[LoRa Rx] Aggregated Heartbeat received: %s\n", messageWithoutCRC.c_str());
-            int firstSep = messageWithoutCRC.indexOf('|');
-            if (firstSep == -1) {
-              Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
-            } else {
-              String senderRelayId = messageWithoutCRC.substring(firstSep + 1, messageWithoutCRC.indexOf('|', firstSep + 1));
-              
-              if (senderRelayId != getCustomNodeId(getNodeId())) {
-                LoRaNode &node = loraNodes[senderRelayId];
-                node.nodeId = senderRelayId;
-                int rssi = radio.getRSSI();
-                float snr = radio.getSNR();
-                uint64_t currentTime = millis();
-                node.lastRSSI = rssi;
-                node.lastSNR = snr;
-                node.lastSeen = currentTime;
-                
-                NodeMetricsSample sample = { currentTime, rssi, snr };
-                node.history.push_back(sample);
-                if (node.history.size() > 60) {
-                  node.history.erase(node.history.begin());
-                }
-                node.statusEmoji = "📡";
-                Serial.printf("[LoRa Nodes] Updated/Added node: %s (Aggregated Heartbeat)\n", senderRelayId.c_str());
-              }
-              
-              int startPos = messageWithoutCRC.indexOf('|', firstSep + 1) + 1;
-              while (true) {
-                int nextSep = messageWithoutCRC.indexOf('|', startPos);
-                String neighborId;
-                if (nextSep == -1) {
-                  neighborId = messageWithoutCRC.substring(startPos);
-                } else {
-                  neighborId = messageWithoutCRC.substring(startPos, nextSep);
-                }
-                
-                if (neighborId.length() > 0 && neighborId != getCustomNodeId(getNodeId())) {
-                  uint64_t currentTime = millis();
-                  int rssi = radio.getRSSI();
-                  float snr = radio.getSNR();
-                  String key = neighborId + "-" + senderRelayId;
-                  auto it = indirectNodes.find(key);
-                  if (it != indirectNodes.end()) {
-                    it->second.lastSeen = currentTime;
-                    it->second.rssi = rssi;
-                    it->second.snr = snr;
-                  } else {
-                    IndirectNode indNode;
-                    indNode.originatorId = neighborId;
-                    indNode.relayId = senderRelayId;
-                    indNode.rssi = rssi;
-                    indNode.snr = snr;
-                    indNode.lastSeen = currentTime;
-                    indNode.statusEmoji = "🛰️";
-                    indirectNodes[key] = indNode;
-                  }
-                  Serial.printf("[Indirect Nodes] Updated 1-hop indirect node: Originator: %s, via Relay: %s, RSSI: %d, SNR: %.2f\n",
-                                neighborId.c_str(), senderRelayId.c_str(), rssi, snr);
-                }
-                
-                if (nextSep == -1) break;
-                startPos = nextSep + 1;
-              }
-            }
-          }
+/* ──────────────────────────────────────────────────────────────
+ *  AGG_HEARTBEAT packet handler
+ *  Format: "AGG_HEARTBEAT|<relayID>|<id1>|<id2>|…|CRC"
+ * ──────────────────────────────────────────────────────────────*/
+else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
+
+  /* pull out the relay ID first — we’ll need it several times */
+  int firstSep  = messageWithoutCRC.indexOf('|');
+  int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);
+
+  if (firstSep == -1 || secondSep == -1) {
+    Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
+  } else {
+
+    String senderRelayId = messageWithoutCRC.substring(firstSep + 1, secondSep);
+
+    /* remember this relay for our lifetime list */
+    addRecentNode(senderRelayId);          // NEW ✅
+    Serial.printf("[LoRa Rx] Aggregated Heartbeat from %s: %s\n",
+                  senderRelayId.c_str(), messageWithoutCRC.c_str());
+
+    /* ── update direct-LoRa node table for the relay itself ── */
+    if (senderRelayId != getCustomNodeId(getNodeId())) {
+      int     rssi   = radio.getRSSI();
+      float   snr    = radio.getSNR();
+      uint64_t now   = millis();
+
+      LoRaNode &node = loraNodes[senderRelayId];
+      node.nodeId    = senderRelayId;
+      node.lastRSSI  = rssi;
+      node.lastSNR   = snr;
+      node.lastSeen  = now;
+
+      NodeMetricsSample s = { now, rssi, snr };
+      node.history.push_back(s);
+      if (node.history.size() > 60) node.history.erase(node.history.begin());
+      node.statusEmoji = "📡";
+    }
+
+    /* ── walk through every originator carried in the packet ── */
+    int startPos = secondSep + 1;
+    while (true) {
+      int nextSep  = messageWithoutCRC.indexOf('|', startPos);
+      String id    = (nextSep == -1)
+                       ? messageWithoutCRC.substring(startPos)
+                       : messageWithoutCRC.substring(startPos, nextSep);
+
+      if (!id.isEmpty() && id != getCustomNodeId(getNodeId())) {
+        addRecentNode(id);                  // NEW ✅  remember originator
+
+        /*  update/insert the 1-hop indirect table  */
+        int     rssi = radio.getRSSI();
+        float   snr  = radio.getSNR();
+        uint64_t now = millis();
+        String   key = id + "-" + senderRelayId;
+
+        auto &ind = indirectNodes[key];
+        ind.originatorId = id;
+        ind.relayId      = senderRelayId;
+        ind.rssi         = rssi;
+        ind.snr          = snr;
+        ind.lastSeen     = now;
+        ind.statusEmoji  = "🛰️";
+
+        NodeMetricsSample s = { now, rssi, snr };
+        ind.history.push_back(s);
+        if (ind.history.size() > 60) ind.history.erase(ind.history.begin());
+      }
+
+      if (nextSep == -1) break;
+      startPos = nextSep + 1;
+    }
+  }
+}
+
           else {
             int firstSeparator = messageWithoutCRC.indexOf('|');
             int secondSeparator = messageWithoutCRC.indexOf('|', firstSeparator + 1);
@@ -1435,6 +1477,9 @@ if (cfg_lora_enabled) {
               String recipientID = messageWithoutCRC.substring(thirdSeparator + 1, fourthSeparator);
               String messageContent = messageWithoutCRC.substring(fourthSeparator + 1, fifthSeparator);
               String relayID = messageWithoutCRC.substring(fifthSeparator + 1);
+
+              addRecentNode(originatorID);      // remember who created the packet
+              addRecentNode(relayID);           // remember the node that relayed it
 
               int rssi = radio.getRSSI();
               float snr = radio.getSNR();
@@ -2124,6 +2169,10 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
       background-color: #fff4e0;
       border-color: orange;
     }
+    .node.recent {
+      background-color: #ffe5e5;   /* pale red */
+      border-color:     #b30000;   /* dark red border */
+    }
     .node-header {
       display: flex;
       align-items: center;
@@ -2179,88 +2228,117 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
       text-decoration: underline;
     }
   </style>
-  <script>
-    function fetchNodes() {
-      fetch('/nodesData')
-        .then(response => response.json())
-        .then(data => {
-          const wifiUl = document.getElementById('wifiNodeList');
-          wifiUl.innerHTML = '';
-          const wifiCount = data.wifiNodes.length;
-          document.getElementById('wifiCount').innerText = 'WiFi Nodes Connected: ' + wifiCount;
-          data.wifiNodes.forEach((node, index) => {
-            const li = document.createElement('li');
-            li.classList.add('node', 'wifi');
-            li.innerHTML = `
-              <div class="node-header">
-                <strong>Node ${index + 1}:</strong>
-                <span>${node}</span>
-              </div>
-              <div class="node-info"></div>
-            `;
-            wifiUl.appendChild(li);
-          });
+<script>
+function fetchNodes() {
+  fetch('/nodesData')
+    .then(r => r.json())
+    .then(data => {                                //  <-- opens MAIN handler
+      /* ------------- Wi-Fi list ------------- */
+      const wifiUl = document.getElementById('wifiNodeList');
+      wifiUl.innerHTML = '';
+      document.getElementById('wifiCount').innerText =
+        'WiFi Nodes Connected: ' + data.wifiNodes.length;
 
-          const loraUl = document.getElementById('loraNodeList');
-          loraUl.innerHTML = '';
-          const loraCount = data.loraNodes.length;
-          document.getElementById('loraCount').innerText = 'Direct LoRa Nodes Active: ' + loraCount;
-          data.loraNodes.forEach((node, index) => {
-            const li = document.createElement('li');
-            li.classList.add('node', 'lora');
-            li.innerHTML = `
-              <div class="node-header">
-                <strong>Node ${index + 1}:</strong>
-                <a href="/loraDetails?nodeId=${encodeURIComponent(node.nodeId)}">${node.nodeId}</a>
-              </div>
-              <div class="node-info">
-                RSSI: ${node.lastRSSI} dBm, SNR: ${node.lastSNR} dB<br>
-                Last seen: ${node.lastSeen}
-              </div>
-              <div class="node-emoji">${node.statusEmoji || ""}</div>
-            `;
-            loraUl.appendChild(li);
-          });
+      data.wifiNodes.forEach((node, i) => {
+        const li = document.createElement('li');
+        li.classList.add('node', 'wifi');
+        li.innerHTML = `
+          <div class="node-header">
+            <strong>Node ${i + 1}:</strong>
+            <span>${node}</span>
+          </div>
+          <div class="node-info"></div>`;
+        wifiUl.appendChild(li);
+      });
 
-          const indirectUl = document.getElementById('indirectNodeList');
-          indirectUl.innerHTML = "";
-          const groupedIndirect = {};
-          data.indirectNodes.forEach((node) => {
-            let originator = node.originatorId;
-            if (!groupedIndirect[originator] || node.lastSeen > groupedIndirect[originator].lastSeen) {
-              groupedIndirect[originator] = node;
-            }
-          });
-          const groupedIndirectArray = Object.values(groupedIndirect);
-          document.getElementById('indirectCount').innerText = 'Indirect Nodes Last Seen: ' + groupedIndirectArray.length;
-          groupedIndirectArray.forEach((node, index) => {
-            const li = document.createElement('li');
-            li.classList.add('node');
-            li.style.backgroundColor = '#f9f9f9';
-            li.style.borderColor = '#999';
-            li.innerHTML = `
-              <div class="node-header">
-                <strong>Originator:</strong>
-                <span>${node.originatorId}</span>
-              </div>
-              <div class="node-info">
-                Last Relay: <a href="/loraDetails?nodeId=${encodeURIComponent(node.relayId)}">${node.relayId}</a><br>
-                RSSI: ${node.rssi} dBm, SNR: ${node.snr} dB<br>
-                Last seen: ${node.lastSeen}
-              </div>
-              <div class="node-emoji">${node.statusEmoji || ""}</div>
-            `;
-            indirectUl.appendChild(li);
-          });
-        })
-        .catch(error => console.error('Error fetching nodes:', error));
-    }
+      /* ------------- direct LoRa list ------------- */
+      const loraUl = document.getElementById('loraNodeList');
+      loraUl.innerHTML = '';
+      document.getElementById('loraCount').innerText =
+        'Direct LoRa Nodes Active: ' + data.loraNodes.length;
 
-    window.onload = function() {
-      fetchNodes();
-      setInterval(fetchNodes, 5000);
-    };
-  </script>
+      data.loraNodes.forEach((node, i) => {
+        const li = document.createElement('li');
+        li.classList.add('node', 'lora');
+        li.innerHTML = `
+          <div class="node-header">
+            <strong>Node ${i + 1}:</strong>
+            <a href="/loraDetails?nodeId=${encodeURIComponent(node.nodeId)}">
+              ${node.nodeId}
+            </a>
+          </div>
+          <div class="node-info">
+            RSSI: ${node.lastRSSI} dBm, SNR: ${node.lastSNR} dB<br>
+            Last seen: ${node.lastSeen}
+          </div>
+          <div class="node-emoji">${node.statusEmoji || ''}</div>`;
+        loraUl.appendChild(li);
+      });
+
+      /* ------------- indirect list ------------- */
+      const indirectUl = document.getElementById('indirectNodeList');
+      indirectUl.innerHTML = '';
+      const grouped = {};
+      data.indirectNodes.forEach(nd => {
+        if (!grouped[nd.originatorId] ||
+            nd.lastSeen > grouped[nd.originatorId].lastSeen)
+          grouped[nd.originatorId] = nd;
+      });
+      const arr = Object.values(grouped);
+      document.getElementById('indirectCount').innerText =
+        'Indirect Nodes Last Seen: ' + arr.length;
+
+      arr.forEach((nd, i) => {
+        const li = document.createElement('li');
+        li.classList.add('node');
+        li.style.backgroundColor = '#f9f9f9';
+        li.style.borderColor     = '#999';
+        li.innerHTML = `
+          <div class="node-header">
+            <strong>Originator:</strong>
+            <span>${nd.originatorId}</span>
+          </div>
+          <div class="node-info">
+            Last Relay:
+              <a href="/loraDetails?nodeId=${encodeURIComponent(nd.relayId)}">
+                ${nd.relayId}
+              </a><br>
+            RSSI: ${nd.rssi} dBm, SNR: ${nd.snr} dB<br>
+            Last seen: ${nd.lastSeen}
+          </div>
+          <div class="node-emoji">${nd.statusEmoji || ''}</div>`;
+        indirectUl.appendChild(li);
+      });
+
+      /* =============  recent nodes  (NEW)  ============= */
+      const recentUl = document.getElementById('recentNodeList');
+      recentUl.innerHTML = '';
+
+      if (Array.isArray(data.recentNodes)) {        // <--- safety-check
+        document.getElementById('recentCount').innerText =
+          'Recent Nodes (lifetime): ' + data.recentNodes.length;
+
+        data.recentNodes.forEach((id, i) => {
+          const li = document.createElement('li');
+          li.classList.add('node', 'recent');       // needs .recent CSS
+          li.innerHTML = `
+            <div class="node-header">
+              <strong>Node ${i + 1}:</strong>
+              <span>${id}</span>
+            </div>`;
+          recentUl.appendChild(li);
+        });
+      }
+    })                                              //  <-- closes MAIN handler
+    .catch(err => console.error('Error fetching nodes:', err));
+}
+
+window.onload = () => {
+  fetchNodes();
+  setInterval(fetchNodes, 5000);
+};
+</script>
+
 </head>
 <body>
   <div class="nav-links">
@@ -2282,6 +2360,10 @@ const char nodesPageHtml[] PROGMEM = R"rawliteral(
     <span id="indirectCount">Indirect Nodes Last Seen: 0</span>
     <ul id="indirectNodeList"></ul>
   </div>
+  <div class="node-section">
+  <span id="recentCount">Recent Nodes (lifetime): 0</span>
+  <ul id="recentNodeList"></ul>
+</div>
 </body>
 </html>
 )rawliteral";
@@ -2821,46 +2903,79 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "application/json", "{\"totalCount\":" + String(totalNodeCount) + ", \"nodeId\":\"" + getCustomNodeId(getNodeId()) + "\"}");
   });
 
-  server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest* request) {
-    updateMeshData();
-    String json = "{\"wifiNodes\":[";
-    auto wifiNodeList = mesh.getNodeList();
-    bool firstWifi = true;
-    for (auto node : wifiNodeList) {
-      if (!firstWifi) json += ",";
-      json += "\"" + getCustomNodeId(node) + "\"";
-      firstWifi = false;
-    }
-    json += "], \"loraNodes\":[";
-    bool firstLora = true;
-    uint64_t currentTime = millis();
-    const uint64_t FIFTEEN_MINUTES = 960000;
-    for (auto const& [nodeId, loraNode] : loraNodes) {
-      uint64_t lastSeenTime = loraNode.lastSeen;
-      if (currentTime - lastSeenTime <= FIFTEEN_MINUTES) {
-        if (!firstLora) json += ",";
-        json += "{\"nodeId\":\"" + nodeId + "\"," 
-              + "\"lastRSSI\":" + String(loraNode.lastRSSI) + "," 
-              + "\"lastSNR\":" + String(loraNode.lastSNR, 2) + "," 
-              + "\"lastSeen\":\"" + formatRelativeTime(currentTime - lastSeenTime) + "\"," 
-              + "\"statusEmoji\":\"" + loraNode.statusEmoji + "\"}";
-        firstLora = false;
-      }
-    }
-    json += "], \"indirectNodes\":[";
-    bool firstIndirect = true;
-    const uint64_t THIRTY_ONE_MINUTES = 1860000;
-    for (auto const& entry : indirectNodes) {
-      if (!firstIndirect) json += ",";
-      const auto &node = entry.second;
-      json += "{\"originatorId\":\"" + node.originatorId + "\",\"relayId\":\"" + node.relayId + "\","; 
-      json += "\"rssi\":" + String(node.rssi) + ",\"snr\":" + String(node.snr, 2) + ",\"lastSeen\":\"" + formatRelativeTime(currentTime - node.lastSeen) + "\","; 
-      json += "\"statusEmoji\":\"" + node.statusEmoji + "\"}";
-      firstIndirect = false;
-    }
-    json += "]}";
-    request->send(200, "application/json", json);
-  });
+// ───────── /nodesData JSON endpoint ─────────
+server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+  updateMeshData();                       // refresh mesh cache first
+  const uint64_t now            = millis();
+  const uint64_t DIRECT_CUTOFF  = 960000;    // 16 min
+  const uint64_t INDIRECT_CUTOFF= 1860000;   // 31 min
+
+  String json = "{";                      // ── root object begin ──
+
+/* ---------- Wi-Fi mesh nodes ---------- */
+json += "\"wifiNodes\":[";
+bool first = true;
+for (uint32_t n : mesh.getNodeList()) {
+  if (!first) json += ",";
+  first = false;
+  json += "\"" + getCustomNodeId(n) + "\"";   // ← includes our own node
+}
+json += "],";
+
+  /* ---------- direct LoRa nodes ---------- */
+  json += "\"loraNodes\":[";
+  first = true;
+  for (const auto &kv : loraNodes) {
+    if (now - kv.second.lastSeen > DIRECT_CUTOFF) continue;   // only “active” ones
+    if (!first) json += ",";
+    first = false;
+
+    const auto &ln = kv.second;
+    json += "{";
+    json += "\"nodeId\":\""      + ln.nodeId + "\",";
+    json += "\"lastRSSI\":"      + String(ln.lastRSSI) + ",";
+    json += "\"lastSNR\":"       + String(ln.lastSNR, 2) + ",";
+    json += "\"lastSeen\":\""    + formatRelativeTime(now - ln.lastSeen) + "\",";
+    json += "\"statusEmoji\":\"" + ln.statusEmoji + "\"";
+    json += "}";
+  }
+  json += "],";
+
+  /* ---------- indirect LoRa nodes ---------- */
+  json += "\"indirectNodes\":[";
+  first = true;
+  for (const auto &kv : indirectNodes) {
+    if (now - kv.second.lastSeen > INDIRECT_CUTOFF) continue; // NEW: timeout
+    if (!first) json += ",";
+    first = false;
+
+    const auto &in = kv.second;
+    json += "{";
+    json += "\"originatorId\":\"" + in.originatorId + "\",";
+    json += "\"relayId\":\""      + in.relayId + "\",";
+    json += "\"rssi\":"           + String(in.rssi) + ",";
+    json += "\"snr\":"            + String(in.snr, 2) + ",";
+    json += "\"lastSeen\":\""     + formatRelativeTime(now - in.lastSeen) + "\",";
+    json += "\"statusEmoji\":\""  + in.statusEmoji + "\"";
+    json += "}";
+  }
+  json += "],";
+
+  /* ---------- lifetime-recent LoRa nodes ---------- */
+  json += "\"recentNodes\":[";
+  first = true;
+  for (const auto &id : getRecentNodes()) {      // assumes helper exists
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + id + "\"";
+  }
+  json += "]";
+
+  json += "}";                                   // ── root object end ──
+
+  request->send(200, "application/json", json);
+});
 
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest* request) {
     String newMessage = "";
