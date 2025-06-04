@@ -1,4 +1,4 @@
-///////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N  GGGGG  L      EEEEE //
 // MM  MM  E      S      H   H  MM  MM  I  NN  N  G      L      E     //
 // M MM M  EEEE   SSSSS  HHHHH  M MM M  I  N N N  G  GG  L      EEEE  //
@@ -6,7 +6,7 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-//Test v1.00.035
+//Test v1.00.036
 //04-06-2025
 //
 //
@@ -23,10 +23,12 @@
 //added perminant node list.
 //fixed bug where nodes are reboot reset message id to 1 and any nodes alreasy relayed those ids wont relay untill you reach 1+ past the id they last sent.
 //another bug where if node reflashed after sending messages relays wont relay because they seen the messssage ids. new solution a nonce at boot.
-//
+//messages has a max setting of 3000 for max time on air however this was not eco for the sytem so now we measure our tx time and usenthat instead of fixed 3000
+//we only see 5 relay emojis then (+1) (+2) etc
+//sent messages show the node id of the first relay that relayed aswell as rssi and snr recived from the relay with our message.
 //
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
-//#define HELTEC_V3
+#define HELTEC_V3
 
 #ifdef HELTEC_V3
   // V3:   LOW  = connect divider, HIGH = disconnect
@@ -473,21 +475,30 @@ void cleanupTransmissionHistory() {
 }
 
 
-// --- Helper functions for dynamic slot calculation ---
-// getTxDuration: returns the measured TX duration in ms; if not available, returns preset 3000 ms.
-unsigned long getTxDuration(String message) {
-  // For now, we simply return 3000. (You can modify this function to compute based on message length.)
-  return 3000;
+// --- TRUE time-on-air helper ------------------------------------------
+// Works with RadioLib ≥ 7.0 (you are already on 7.1.2)
+// Adds 100 ms extra so RX has time to restart before the next slot.
+unsigned long getTxDuration(const String& message)
+{
+    // 1) microseconds for this exact payload
+    uint32_t us = radio.getTimeOnAir(message.length());
+
+    // 2) round up to milliseconds + 100 ms guard
+    return (us + 999) / 1000 + 100;
 }
 
-// getDynamicSlot: computes the slot duration as baseSlot plus an offset derived from RSSI.
-// Here we map RSSI (from -120 to -50) to an offset from 0 to 500 ms.
-unsigned long getDynamicSlot(unsigned long baseSlot, int rssi) {
-  if (baseSlot == 0) baseSlot = 3000; // default if not available
-  if (rssi < -180) rssi = -180;
-  if (rssi > -15) rssi = -15;
-  int rssiOffset = map(rssi, -180, -15, 0, 4000);
-  return baseSlot + rssiOffset;
+// getDynamicSlot: adds an RSSI-dependent back-off
+// RSSI −120 dBm ⇒ +500 ms  … RSSI −50 dBm ⇒ +0 ms
+unsigned long getDynamicSlot(unsigned long baseSlot, int rssi)
+{
+    // baseSlot is never 0 now, but keep a small fallback just in case
+    if (baseSlot == 0) baseSlot = 1000;
+
+    // clamp RSSI to expected range
+    rssi = constrain(rssi, -150, -15);
+    int rssiOffset = map(rssi, -150, -15, 600, 0);   // up to 600 ms for weak links
+
+    return baseSlot + rssiOffset;   // final slot length
 }
 
 // --- UPDATED addMessage() to accept the recipient and only add private messages if intended ---
@@ -685,7 +696,7 @@ void scheduleLoRaTransmission(String message, int measuredRssi = -100) {
         loraTransmissionQueue.push_back(updatedMessage);
         status.queuedForLoRa = true;
         // Calculate dynamic slot:
-        unsigned long baseSlot = getTxDuration(message); // default returns 3000 ms
+        unsigned long baseSlot = getTxDuration(updatedMessage); // true Tx-time + 100 ms
         unsigned long dynamicSlot = getDynamicSlot(baseSlot, measuredRssi);
         unsigned long totalWindow = 35000; // 35 seconds total window
         int numSlots = totalWindow / dynamicSlot;
@@ -977,7 +988,7 @@ void transmitWithDutyCycle(const String& message) {
           loRaTransmitDelay = millis() + 2000;
           Serial.printf("[LoRa Tx] Scheduling a retry for own message %s with fixed 2-second delay\n", messageID.c_str());
       } else {
-          unsigned long baseSlot = getTxDuration(message); // default 3000 ms if not available
+          unsigned long baseSlot = getTxDuration(message);   // true Tx-time + 100 ms
           unsigned long dynamicSlot = getDynamicSlot(baseSlot, -100); // For retry, if no new measurement, use default RSSI of -100
           unsigned long totalWindow = 35000; // 35 seconds total window
           int numSlots = totalWindow / dynamicSlot;
@@ -1782,6 +1793,12 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
       border-radius: 10px;
       box-sizing: border-box;
     }
+.first-relay {
+  font-size: 0.75em;        /* small, but readable                 */
+  color: #555;
+  display: block;           /* own line                             */
+  margin: 0;                /* ← no spare space above or below      */
+}
     #messageForm {
       width: 100%;
       max-width: 600px;
@@ -1890,6 +1907,10 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
     .message.sent .relay-status .satellite,
     .message.sent .relay-status .keyboard {
       font-size: 1em;
+    }
+    .message.sent .relay-status .extra {
+      font-size: 0.8em;      /* small text */
+      margin-left: 2px;
     }
     #deviceCount {
       margin: 5px 0;
@@ -2036,25 +2057,47 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
             relayHtml = `<span class="message-relayid">Relay Id: ${msg.relayID}</span>`;
           }
 
-          li.innerHTML = `
-            <span class="message-nodeid">${nodeIdHtml}</span>
-            <div class="message-content">${senderHtml}${privateIndicator}${msg.content}</div>
-            ${relayHtml}
-            <span class="message-time">${timestamp}</span>
-            ${rssiSnrHtml}
-          `;
-          if (isSentByCurrentNode) {
-            let indicator = "";
-            if (msg.relayIDs && msg.relayIDs.length > 0) {
-              indicator += '<span class="circle">🟢</span>';
-              for (let i = 0; i < msg.relayIDs.length; i++) {
-                indicator += '<span class="satellite">🛰️</span>';
-              }
-            } else {
-              indicator = '<span class="circle">🔴</span><span class="keyboard">⌨️</span>';
-            }
-            li.innerHTML += `<span class="relay-status">${indicator}</span>`;
-          }
+const firstRelayLabel =
+        (msg.relayIDs && msg.relayIDs.length)
+          ? `<span class="first-relay">Relay: ${msg.relayIDs[0]}</span>`
+          : '';
+
+li.innerHTML = `
+  <span class="message-nodeid">${nodeIdHtml}</span>
+  <div class="message-content">${senderHtml}${privateIndicator}${msg.content}</div>
+  ${firstRelayLabel}                     <!-- 3rd row ⬅️ -->
+  ${relayHtml}
+  <span class="message-time">${timestamp}</span>
+  ${rssiSnrHtml}
+`;
+
+if (isSentByCurrentNode) {
+  let indicator   = "";
+  const relays    = msg.relayIDs ? msg.relayIDs.length : 0;
+  const maxIcons  = 5;                         // ① hard cap
+  const shown     = Math.min(relays, maxIcons);
+  const leftover  = relays - shown;            // ② extra after the cap
+
+  if (relays > 0) {
+    indicator += '<span class="circle">🟢</span>';
+    for (let i = 0; i < shown; i++) {          // ③ only up to five
+      indicator += '<span class="satellite">🛰️</span>';
+    }
+    if (leftover > 0) {                        // ④ add “(+n)”
+      indicator += `<span class="extra">(+${leftover})</span>`;
+    }
+  } else {
+    indicator = '<span class="circle">🔴</span><span class="keyboard">⌨️</span>';
+  }
+
+/*  ▼ NEW: show this line only if it’s one of *our* messages         */
+const firstRelayLabel =
+      (isSentByCurrentNode && msg.relayIDs && msg.relayIDs.length)
+        ? `<span class="first-relay">Relay: ${msg.relayIDs[0]}</span>`
+        : '';
+
+  li.innerHTML += `<span class="relay-status">${indicator}</span>`;
+}
           ul.appendChild(li);
         });
 
