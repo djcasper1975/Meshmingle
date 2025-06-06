@@ -6,8 +6,8 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-//Test v1.00.036
-//04-06-2025
+//Test v1.00.037
+//06-06-2025
 //
 //
 //
@@ -26,7 +26,10 @@
 //messages has a max setting of 3000 for max time on air however this was not eco for the sytem so now we measure our tx time and usenthat instead of fixed 3000
 //we only see 5 relay emojis then (+1) (+2) etc
 //sent messages show the node id of the first relay that relayed aswell as rssi and snr recived from the relay with our message.
-//
+//added heartbeat and agg heartbeat tamper detection.
+//battery tests changs.
+
+
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
 #define HELTEC_V3
 
@@ -86,7 +89,7 @@ const  unsigned long RX_KICK_MS   = 600000UL;   // 10 min
 const  unsigned long RX_IDLE_CAP  = 3000UL;     // avoid kicking while busy
 
 // Calibration: actual vs raw based on 3.7 v 1100mah 4.07w Lithium Battery
-const float measuredV  = 4.20f;   // battery full
+const float measuredV  = 4.10f;   // battery full
 const float reportedV  = 3.800f;  // divider pin at full
 const float reportedV0 = 2.800f;  // divider pin at empty
 const float measuredV0 = (reportedV0 / reportedV) * measuredV;
@@ -97,15 +100,15 @@ float      vMin, vMax;
 const float presetVMin = measuredV;  
 const float presetVMax = measuredV0;
 // how much surface-charge offset to subtract from your peak
-const float calibrationOffset = 0.000f; // this only made things worse by always - value even if battery fully charged. each reading would -
+const float calibrationOffset = 0.000f; // this only made things worse by always - value even if battery fully charged. each reading would - FROM ITS LAST
 const float updateThreshold = 0.005f; // 5 mV
 
 // nominal battery endpoints
-const float nominalVmin = 3.30f;
-const float nominalVmax = 4.20f;
+const float nominalVmin = 2.80f;
+const float nominalVmax = 4.10f;
 
 
-float  calSlope     = 1.0f;
+float  calSlope     = 1.0f; 
 float  calIntercept = 0.0f;
 
 // raw-extrema storage (instead of vMin/vMax)
@@ -1370,98 +1373,133 @@ if (cfg_lora_enabled) {
             }
           }
 
-          if (messageWithoutCRC.startsWith("HEARTBEAT|")) {
-            String senderNodeId = messageWithoutCRC.substring(strlen("HEARTBEAT|"));
-            addRecentNode(senderNodeId);     // ← NEW – remember the direct LoRa node
-            Serial.printf("[LoRa Rx] Heartbeat from %s\n", senderNodeId.c_str());
-            int rssi = radio.getRSSI();
-            float snr = radio.getSNR();
-            uint64_t currentTime = millis();
-            // For heartbeat packets we update here (if needed)
-            if (senderNodeId != getCustomNodeId(getNodeId())) {
-              LoRaNode& node = loraNodes[senderNodeId];
-              node.nodeId = senderNodeId;
-              node.lastRSSI = rssi;
-              node.lastSNR = snr;
-              node.lastSeen = currentTime;
+// ─────────────────────────────────────────────────────────────────────────────
+//                LoRa RX handler (inside loop(), after CRC check)
+// ─────────────────────────────────────────────────────────────────────────────
 
-              NodeMetricsSample sample = { currentTime, rssi, snr };
-              node.history.push_back(sample);
-              if (node.history.size() > 60) {
-                node.history.erase(node.history.begin());
-              }
-              node.statusEmoji = "❤️";
-              Serial.printf("[LoRa Nodes] Updated/Added node: %s (Heartbeat)\n", senderNodeId.c_str());
-            } else {
-              Serial.println("[LoRa Rx] Own heartbeat, ignore.");
-            }
-          }
-/* ──────────────────────────────────────────────────────────────
- *  AGG_HEARTBEAT packet handler
- *  Format: "AGG_HEARTBEAT|<relayID>|<id1>|<id2>|…|CRC"
- * ──────────────────────────────────────────────────────────────*/
+if (messageWithoutCRC.startsWith("HEARTBEAT|")) {
+  // Find the two ‘|’ positions
+  int firstSep  = messageWithoutCRC.indexOf('|');                     // index of the first '|'
+  int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);       // index of the second '|' (if any)
+
+  // Extract exactly the node‐ID (no extra “|…”)
+  String senderNodeId;
+  if (secondSep == -1) {
+    senderNodeId = messageWithoutCRC.substring(firstSep + 1);
+  } else {
+    senderNodeId = messageWithoutCRC.substring(firstSep + 1, secondSep);
+  }
+
+  // Mark “tampered” if there was a second ‘|’
+  bool tampered = (secondSep != -1);
+
+  // ── HERE: grab RSSI/SNR from radio for our own update (but we still only pass ID into addRecentNode)
+  int  rssi = radio.getRSSI();
+  float snr  = radio.getSNR();
+
+  // Remember the node by ID only
+  addRecentNode(senderNodeId);
+
+  Serial.printf("[LoRa Rx] Heartbeat from %s (tampered=%s)\n",
+                senderNodeId.c_str(),
+                tampered ? "yes" : "no");
+
+  // If it’s not our own heartbeat, update our LoRa‐node map
+  if (senderNodeId != getCustomNodeId(getNodeId())) {
+    uint64_t now = millis();
+
+    LoRaNode& node = loraNodes[senderNodeId];
+    node.nodeId   = senderNodeId;
+    node.lastRSSI = rssi;
+    node.lastSNR  = snr;
+    node.lastSeen = now;
+
+    NodeMetricsSample sample = { now, rssi, snr };
+    node.history.push_back(sample);
+    if (node.history.size() > 60) {
+      node.history.erase(node.history.begin());
+    }
+
+    // If tampered, prefix “⚠️” before the heart emoji
+    node.statusEmoji = tampered ? "⚠️❤️" : "❤️";
+
+    Serial.printf("[LoRa Nodes] Updated/Added node: %s (Heartbeat)\n",
+                  senderNodeId.c_str());
+  } else {
+    Serial.println("[LoRa Rx] Own heartbeat, ignore.");
+  }
+}
+
 else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
-
-  /* pull out the relay ID first — we’ll need it several times */
+  // Pull out the first two ‘|’ so we can get the relay‐ID
   int firstSep  = messageWithoutCRC.indexOf('|');
   int secondSep = messageWithoutCRC.indexOf('|', firstSep + 1);
 
   if (firstSep == -1 || secondSep == -1) {
     Serial.println("[LoRa Rx] Invalid AGG_HEARTBEAT format.");
   } else {
-
+    // Extract only the relay ID (no following “|…”)
     String senderRelayId = messageWithoutCRC.substring(firstSep + 1, secondSep);
 
-    /* remember this relay for our lifetime list */
-    addRecentNode(senderRelayId);          // NEW ✅
-    Serial.printf("[LoRa Rx] Aggregated Heartbeat from %s: %s\n",
-                  senderRelayId.c_str(), messageWithoutCRC.c_str());
+    // If there’s a third pipe, it means extra fields got stuffed in
+    bool tampered = (messageWithoutCRC.indexOf('|', secondSep + 1) != -1);
 
-    /* ── update direct-LoRa node table for the relay itself ── */
+    // ── Get RSSI/SNR from radio (used for updating our own tables, not passed into addRecentNode)
+    int  rssi = radio.getRSSI();
+    float snr  = radio.getSNR();
+
+    // Remember the relay itself by ID only
+    addRecentNode(senderRelayId);
+    Serial.printf("[LoRa Rx] Aggregated Heartbeat from %s (tampered=%s): %s\n",
+                  senderRelayId.c_str(),
+                  tampered ? "yes" : "no",
+                  messageWithoutCRC.c_str());
+
+    // Update our direct‐LoRa table for the relay node itself
     if (senderRelayId != getCustomNodeId(getNodeId())) {
-      int     rssi   = radio.getRSSI();
-      float   snr    = radio.getSNR();
-      uint64_t now   = millis();
+      uint64_t now = millis();
 
       LoRaNode &node = loraNodes[senderRelayId];
-      node.nodeId    = senderRelayId;
-      node.lastRSSI  = rssi;
-      node.lastSNR   = snr;
-      node.lastSeen  = now;
+      node.nodeId   = senderRelayId;
+      node.lastRSSI = rssi;
+      node.lastSNR  = snr;
+      node.lastSeen = now;
 
       NodeMetricsSample s = { now, rssi, snr };
       node.history.push_back(s);
       if (node.history.size() > 60) node.history.erase(node.history.begin());
-      node.statusEmoji = "📡";
+
+      // “?📡” if someone stuffed extra fields, otherwise “📡”
+      node.statusEmoji = tampered ? "⚠️📡" : "📡";
     }
 
-    /* ── walk through every originator carried in the packet ── */
+    /* ── Now walk through every originator ID carried in this aggregated packet ── */
     int startPos = secondSep + 1;
     while (true) {
-      int nextSep  = messageWithoutCRC.indexOf('|', startPos);
-      String id    = (nextSep == -1)
-                       ? messageWithoutCRC.substring(startPos)
-                       : messageWithoutCRC.substring(startPos, nextSep);
+      int nextSep = messageWithoutCRC.indexOf('|', startPos);
+      String id   = (nextSep == -1)
+                      ? messageWithoutCRC.substring(startPos)
+                      : messageWithoutCRC.substring(startPos, nextSep);
 
       if (!id.isEmpty() && id != getCustomNodeId(getNodeId())) {
-        addRecentNode(id);                  // NEW ✅  remember originator
+        // Remember the originator ID by itself (no RSSI/SNR)
+        addRecentNode(id);
 
-        /*  update/insert the 1-hop indirect table  */
-        int     rssi = radio.getRSSI();
-        float   snr  = radio.getSNR();
-        uint64_t now = millis();
-        String   key = id + "-" + senderRelayId;
+        /* Update/insert into our 1‐hop indirect table */
+        // We reuse the same rssi/snr we just read from the relay
+        uint64_t now2 = millis();
+        String   key  = id + "-" + senderRelayId;
 
         auto &ind = indirectNodes[key];
         ind.originatorId = id;
         ind.relayId      = senderRelayId;
         ind.rssi         = rssi;
         ind.snr          = snr;
-        ind.lastSeen     = now;
+        ind.lastSeen     = now2;
         ind.statusEmoji  = "🛰️";
 
-        NodeMetricsSample s = { now, rssi, snr };
-        ind.history.push_back(s);
+        NodeMetricsSample s2 = { now2, rssi, snr };
+        ind.history.push_back(s2);
         if (ind.history.size() > 60) ind.history.erase(ind.history.begin());
       }
 
@@ -1470,7 +1508,6 @@ else if (messageWithoutCRC.startsWith("AGG_HEARTBEAT|")) {
     }
   }
 }
-
           else {
             int firstSeparator = messageWithoutCRC.indexOf('|');
             int secondSeparator = messageWithoutCRC.indexOf('|', firstSeparator + 1);
