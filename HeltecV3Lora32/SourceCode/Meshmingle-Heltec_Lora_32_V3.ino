@@ -31,7 +31,7 @@
 
 
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
-#define HELTEC_V3
+//#define HELTEC_V3
 
 #ifdef HELTEC_V3
   // V3:   LOW  = connect divider, HIGH = disconnect
