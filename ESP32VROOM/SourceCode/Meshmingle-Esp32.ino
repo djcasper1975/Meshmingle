@@ -1,5 +1,5 @@
-//Test v1.00.036
-//27-05-2025
+//Test v1.00.037
+//06-06-2025
 //MAKE SURE ALL NODES USE THE SAME VERSION OR EXPECT STRANGE THINGS HAPPENING.
 //Changed network name.
 //added private messages to other nodes.
