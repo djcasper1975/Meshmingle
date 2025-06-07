@@ -6,8 +6,8 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-//Test v1.00.037
-//06-06-2025
+//Test v1.00.038
+//07-06-2025
 //
 //
 //
@@ -28,7 +28,16 @@
 //sent messages show the node id of the first relay that relayed aswell as rssi and snr recived from the relay with our message.
 //added heartbeat and agg heartbeat tamper detection.
 //battery tests changs.
-
+//addeed nickname to forever nodes
+//added nickname to online lora nodes list.
+//added nickname to messages incomming.
+//nickname is in all nodelist now. and also shouild be on all pages.
+//lora nodepage had blue in nickname still.
+//incoming messages have nickname now.
+//indirect nodelist has nickname now.
+//removed bold from the nickname on recived messages.
+//carousel update we dont showe private messages we show nickname and how many messages there are.
+//
 
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
 //#define HELTEC_V3
@@ -60,6 +69,7 @@
 #include <Preferences.h>  
 #include "settings_feature.h"
 #include "recent_nodes_feature.h"
+#include "node_nickname_feature.h"
 
 // ── Battery monitoring ───────────────────────────────────
 #define VBAT_Read  1    // ADC1 channel 1 (divider output)
@@ -884,18 +894,35 @@ void displayCarousel() {
 
     String myId = getCustomNodeId(getNodeId());
     std::vector<Message> filteredMessages;
-    
+
+    // Collect only private messages involving this node
     for (const auto& msg : messages) {
       if (msg.recipient != "ALL" && (msg.recipient == myId || msg.nodeId == myId)) {
         filteredMessages.push_back(msg);
       }
     }
 
-    if (filteredMessages.empty()) {
+    // Map nodeId to message count and name
+    std::map<String, int> nodeMsgCounts;
+    std::map<String, String> nodeSenders;  // To get sender for display
+
+    for (const auto& msg : filteredMessages) {
+      nodeMsgCounts[msg.nodeId]++;
+      nodeSenders[msg.nodeId] = msg.sender;
+    }
+
+    // Create list of unique nodeIds for carousel display
+    std::vector<String> nodeIds;
+    for (const auto& pair : nodeMsgCounts) {
+      nodeIds.push_back(pair.first);
+    }
+
+    // Handle empty state
+    if (nodeIds.empty()) {
       carouselIndex = 0;
     } else {
       carouselIndex++;
-      if (carouselIndex > (int)filteredMessages.size()) {
+      if (carouselIndex > (int)nodeIds.size()) {
         carouselIndex = 0;
       }
     }
@@ -906,16 +933,30 @@ void displayCarousel() {
     if (carouselIndex == 0) {
       drawMainScreen(-1);
     } else {
-      int msgIndex = carouselIndex - 1;
-      if (msgIndex < (int)filteredMessages.size()) {
-        String nodeLine = "Node: " + filteredMessages[msgIndex].nodeId;
+      int nodeIdx = carouselIndex - 1;
+      if (nodeIdx < (int)nodeIds.size()) {
+        String nodeId = nodeIds[nodeIdx];
+        int count = nodeMsgCounts[nodeId];
+        String senderName = nodeSenders[nodeId];
+
+        // Node ID on first line
+        String nodeLine = "Node: " + nodeId;
         display.drawString(0, 0, nodeLine);
 
-        String nameLine = "Name: " + filteredMessages[msgIndex].sender;
-        display.drawString(0, 13, nameLine);
+        // Nickname under Node ID
+        String nickname = getNodeNickname(nodeId);
+        if (nickname.length() > 0) {
+          display.drawString(0, 11, "Nickname: " + nickname);
+        }
 
-        display.drawString(0, 26, "[Private]");
-        display.drawString(0, 36, filteredMessages[msgIndex].content);
+        // Name (sender)
+        int nameLineY = (nickname.length() > 0) ? 22 : 13;
+        String nameLine = "Name: " + senderName;
+        display.drawString(0, nameLineY, nameLine);
+
+        // Private message count
+        int countLineY = nameLineY + 13;
+        display.drawString(0, countLineY, "Private Msgs: " + String(count));
       }
     }
     display.display();
@@ -1138,6 +1179,7 @@ void onRadioRx() {
 void setup() {
   loadConfig();
   loadRecentNodes();   // <-- NEW: keep lifetime list of every LoRa node we’ve seen
+  loadNodeNicknames();
   mesh.init(cfg_ssid.c_str(),           // <— from settings_feature
           cfg_pass.c_str(),
           MESH_PORT,
@@ -2077,7 +2119,10 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
             timestamp = `${years} year${years > 1 ? 's' : ''} ago`;
           }
 
-          const nodeIdHtml = `Node Id: ${msg.nodeId}`;
+          const nickname = msg.nickname;
+          const nodeIdHtml = nickname && nickname.length > 0
+            ? `Node Id: ${msg.nodeId} (${nickname})`
+            : `Node Id: ${msg.nodeId}`;
           const senderHtml = `<strong>${msg.sender || 'Unknown'}:</strong> `;
           let privateIndicator = "";
           if (msg.recipient && msg.recipient !== "ALL") {
@@ -2319,17 +2364,19 @@ function fetchNodes() {
       document.getElementById('wifiCount').innerText =
         'WiFi Nodes Connected: ' + data.wifiNodes.length;
 
-      data.wifiNodes.forEach((node, i) => {
-        const li = document.createElement('li');
-        li.classList.add('node', 'wifi');
-        li.innerHTML = `
-          <div class="node-header">
-            <strong>Node ${i + 1}:</strong>
-            <span>${node}</span>
-          </div>
-          <div class="node-info"></div>`;
-        wifiUl.appendChild(li);
-      });
+data.wifiNodes.forEach((node, i) => {
+  const nickname = data.wifiNodeNicknames && data.wifiNodeNicknames[node] ? data.wifiNodeNicknames[node] : '';
+  let label = nickname.length ? `${node} (${nickname})` : node;
+  const li = document.createElement('li');
+  li.classList.add('node', 'wifi');
+  li.innerHTML = `
+    <div class="node-header">
+      <strong>Node ${i + 1}:</strong>
+      <a href="/nickname?node=${encodeURIComponent(node)}">${label}</a>
+    </div>
+    <div class="node-info"></div>`;
+  wifiUl.appendChild(li);
+});
 
       /* ------------- direct LoRa list ------------- */
       const loraUl = document.getElementById('loraNodeList');
@@ -2337,23 +2384,26 @@ function fetchNodes() {
       document.getElementById('loraCount').innerText =
         'Direct LoRa Nodes Active: ' + data.loraNodes.length;
 
-      data.loraNodes.forEach((node, i) => {
-        const li = document.createElement('li');
-        li.classList.add('node', 'lora');
-        li.innerHTML = `
-          <div class="node-header">
-            <strong>Node ${i + 1}:</strong>
-            <a href="/loraDetails?nodeId=${encodeURIComponent(node.nodeId)}">
-              ${node.nodeId}
-            </a>
-          </div>
-          <div class="node-info">
-            RSSI: ${node.lastRSSI} dBm, SNR: ${node.lastSNR} dB<br>
-            Last seen: ${node.lastSeen}
-          </div>
-          <div class="node-emoji">${node.statusEmoji || ''}</div>`;
-        loraUl.appendChild(li);
-      });
+data.loraNodes.forEach((node, i) => {
+  const li = document.createElement('li');
+  li.classList.add('node', 'lora');
+  let label = node.nickname
+    ? `${node.nodeId} (${node.nickname})`
+    : node.nodeId;
+  li.innerHTML = `
+    <div class="node-header">
+      <strong>Node ${i + 1}:</strong>
+      <a href="/loraDetails?nodeId=${encodeURIComponent(node.nodeId)}">
+        ${label}
+      </a>
+    </div>
+    <div class="node-info">
+      RSSI: ${node.lastRSSI} dBm, SNR: ${node.lastSNR} dB<br>
+      Last seen: ${node.lastSeen}
+    </div>
+    <div class="node-emoji">${node.statusEmoji || ''}</div>`;
+  loraUl.appendChild(li);
+});
 
       /* ------------- indirect list ------------- */
       const indirectUl = document.getElementById('indirectNodeList');
@@ -2368,27 +2418,31 @@ function fetchNodes() {
       document.getElementById('indirectCount').innerText =
         'Indirect Nodes Last Seen: ' + arr.length;
 
-      arr.forEach((nd, i) => {
-        const li = document.createElement('li');
-        li.classList.add('node');
-        li.style.backgroundColor = '#f9f9f9';
-        li.style.borderColor     = '#999';
-        li.innerHTML = `
-          <div class="node-header">
-            <strong>Originator:</strong>
-            <span>${nd.originatorId}</span>
-          </div>
-          <div class="node-info">
-            Last Relay:
-              <a href="/loraDetails?nodeId=${encodeURIComponent(nd.relayId)}">
-                ${nd.relayId}
-              </a><br>
-            RSSI: ${nd.rssi} dBm, SNR: ${nd.snr} dB<br>
-            Last seen: ${nd.lastSeen}
-          </div>
-          <div class="node-emoji">${nd.statusEmoji || ''}</div>`;
-        indirectUl.appendChild(li);
-      });
+arr.forEach((nd, i) => {
+  const li = document.createElement('li');
+  li.classList.add('node');
+  li.style.backgroundColor = '#f9f9f9';
+  li.style.borderColor     = '#999';
+  // Clickable link to nickname page
+  let nodeLabel = (nd.nickname && nd.nickname.length > 0)
+    ? `<a href="/nickname?node=${encodeURIComponent(nd.originatorId)}">${nd.originatorId} (<b>${nd.nickname}</b>)</a>`
+    : `<a href="/nickname?node=${encodeURIComponent(nd.originatorId)}">${nd.originatorId}</a>`;
+  li.innerHTML = `
+    <div class="node-header">
+      <strong>Originator:</strong>
+      <span>${nodeLabel}</span>
+    </div>
+    <div class="node-info">
+      Last Relay:
+        <a href="/loraDetails?nodeId=${encodeURIComponent(nd.relayId)}">
+          ${nd.relayId}
+        </a><br>
+      RSSI: ${nd.rssi} dBm, SNR: ${nd.snr} dB<br>
+      Last seen: ${nd.lastSeen}
+    </div>
+    <div class="node-emoji">${nd.statusEmoji || ''}</div>`;
+  indirectUl.appendChild(li);
+});
 
       /* =============  recent nodes  (NEW)  ============= */
       const recentUl = document.getElementById('recentNodeList');
@@ -2398,16 +2452,20 @@ function fetchNodes() {
         document.getElementById('recentCount').innerText =
           'Recent Nodes (lifetime): ' + data.recentNodes.length;
 
-        data.recentNodes.forEach((id, i) => {
-          const li = document.createElement('li');
-          li.classList.add('node', 'recent');       // needs .recent CSS
-          li.innerHTML = `
-            <div class="node-header">
-              <strong>Node ${i + 1}:</strong>
-              <span>${id}</span>
-            </div>`;
-          recentUl.appendChild(li);
-        });
+data.recentNodes.forEach((node, i) => {
+  const li = document.createElement('li');
+  li.classList.add('node', 'recent');
+  // Show nickname (if set) before the nodeId, clickable for editing
+  let label = node.nickname
+    ? `<a href="/nickname?node=${encodeURIComponent(node.id)}">${node.id} (${node.nickname})</a>`
+    : `<a href="/nickname?node=${encodeURIComponent(node.id)}">${node.id}</a>`;
+  li.innerHTML = `
+    <div class="node-header">
+      <strong>Node ${i + 1}:</strong>
+      <span>${label}</span>
+    </div>`;
+  recentUl.appendChild(li);
+});
       }
     })                                              //  <-- closes MAIN handler
     .catch(err => console.error('Error fetching nodes:', err));
@@ -2575,10 +2633,17 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
               const nodeBlock = document.createElement("div");
               nodeBlock.classList.add("node-block");
 
-              const nodeTitle = document.createElement("div");
-              nodeTitle.classList.add("node-title");
-              nodeTitle.textContent = `Node ID: ${node.nodeId}`;
-              nodeBlock.appendChild(nodeTitle);
+const nodeTitle = document.createElement("div");
+nodeTitle.classList.add("node-title");
+nodeTitle.textContent = `Node ID: ${node.nodeId}`;
+nodeBlock.appendChild(nodeTitle);
+
+if (node.nickname && node.nickname.length) {
+  // Use a normal <p> just like all other fields for consistent styling
+  const p = document.createElement("p");
+  p.innerHTML = "<strong>Nickname:</strong> " + node.nickname;
+  nodeBlock.appendChild(p);
+}
 
               const summaryTable = document.createElement("table");
               const summaryHeader = document.createElement("thead");
@@ -2647,10 +2712,18 @@ const char metricsPageHtml[] PROGMEM = R"rawliteral(
               const originatorBlock = document.createElement("div");
               originatorBlock.classList.add("node-block");
 
-              const originatorTitle = document.createElement("div");
-              originatorTitle.classList.add("node-title");
-              originatorTitle.textContent = `Originator: ${originator}`;
-              originatorBlock.appendChild(originatorTitle);
+const originatorTitle = document.createElement("div");
+originatorTitle.classList.add("node-title");
+originatorTitle.textContent = `Originator: ${originator}`;
+originatorBlock.appendChild(originatorTitle);
+
+// --- Nickname under Originator, plain style ---
+const groupNickname = group[0].nickname;
+if (groupNickname && groupNickname.length) {
+  const p = document.createElement("p");
+  p.innerHTML = "<strong>Nickname:</strong> " + groupNickname;
+  originatorBlock.appendChild(p);
+}
 
               group.forEach(relay => {
                 const subNodeBlock = document.createElement("div");
@@ -2952,7 +3025,9 @@ server.on("/messages", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!first) json += ",";
     String fullMsg = msg.messageID + "|" + msg.nodeId + "|" + msg.sender + "|" + msg.recipient + "|" + msg.content + "|" + msg.relayID;
     String emoji = determineTxType(fullMsg);
+    String nickname = getNodeNickname(msg.nodeId);
     json += "{\"nodeId\":\"" + msg.nodeId + "\",";
+    json += "\"nickname\":\"" + nickname + "\",";
     json += "\"sender\":\"" + msg.sender + "\",";
     json += "\"recipient\":\"" + msg.recipient + "\",";
     json += "\"content\":\"" + msg.content + "\",";
@@ -2993,17 +3068,30 @@ server.on("/nodesData", HTTP_GET, [](AsyncWebServerRequest *request) {
 
   String json = "{";                      // ── root object begin ──
 
-/* ---------- Wi-Fi mesh nodes ---------- */
-json += "\"wifiNodes\":[";
-bool first = true;
-for (uint32_t n : mesh.getNodeList()) {
-  if (!first) json += ",";
-  first = false;
-  json += "\"" + getCustomNodeId(n) + "\"";   // ← includes our own node
-}
-json += "],";
+  /* ---------- Wi-Fi mesh nodes ---------- */
+  json += "\"wifiNodes\":[";
+  bool first = true;
+  for (uint32_t n : mesh.getNodeList()) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + getCustomNodeId(n) + "\"";   // ← includes our own node
+  }
+  json += "],";
 
-  /* ---------- direct LoRa nodes ---------- */
+  json += "\"wifiNodeNicknames\":{";
+first = true;
+for (uint32_t n : mesh.getNodeList()) {
+  String nodeId = getCustomNodeId(n);
+  String nickname = getNodeNickname(nodeId);  // same function as LoRa
+  if (nickname.length()) {
+    if (!first) json += ",";
+    json += "\"" + nodeId + "\":\"" + nickname + "\"";
+    first = false;
+  }
+}
+json += "},";
+
+  /* ---------- direct LoRa nodes (now with nickname) ---------- */
   json += "\"loraNodes\":[";
   first = true;
   for (const auto &kv : loraNodes) {
@@ -3012,8 +3100,10 @@ json += "],";
     first = false;
 
     const auto &ln = kv.second;
+    String nickname = getNodeNickname(ln.nodeId);
     json += "{";
     json += "\"nodeId\":\""      + ln.nodeId + "\",";
+    json += "\"nickname\":\""    + nickname + "\",";
     json += "\"lastRSSI\":"      + String(ln.lastRSSI) + ",";
     json += "\"lastSNR\":"       + String(ln.lastSNR, 2) + ",";
     json += "\"lastSeen\":\""    + formatRelativeTime(now - ln.lastSeen) + "\",";
@@ -3022,7 +3112,7 @@ json += "],";
   }
   json += "],";
 
-  /* ---------- indirect LoRa nodes ---------- */
+  /* ---------- indirect LoRa nodes (now with nickname) ---------- */
   json += "\"indirectNodes\":[";
   first = true;
   for (const auto &kv : indirectNodes) {
@@ -3031,8 +3121,10 @@ json += "],";
     first = false;
 
     const auto &in = kv.second;
+    String nickname = getNodeNickname(in.originatorId);
     json += "{";
     json += "\"originatorId\":\"" + in.originatorId + "\",";
+    json += "\"nickname\":\""     + nickname + "\",";
     json += "\"relayId\":\""      + in.relayId + "\",";
     json += "\"rssi\":"           + String(in.rssi) + ",";
     json += "\"snr\":"            + String(in.snr, 2) + ",";
@@ -3042,13 +3134,17 @@ json += "],";
   }
   json += "],";
 
-  /* ---------- lifetime-recent LoRa nodes ---------- */
+  /* ---------- lifetime-recent LoRa nodes (with nicknames) ---------- */
   json += "\"recentNodes\":[";
   first = true;
-  for (const auto &id : getRecentNodes()) {      // assumes helper exists
-    if (!first) json += ",";
-    first = false;
-    json += "\"" + id + "\"";
+  for (const auto &id : getRecentNodes()) {
+      if (!first) json += ",";
+      first = false;
+      String nickname = getNodeNickname(id);
+      json += "{";
+      json += "\"id\":\"" + id + "\"";
+      json += ",\"nickname\":\"" + nickname + "\"";
+      json += "}";
   }
   json += "]";
 
@@ -3056,6 +3152,7 @@ json += "],";
 
   request->send(200, "application/json", json);
 });
+
 
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest* request) {
     String newMessage = "";
@@ -3105,7 +3202,7 @@ json += "],";
     request->send_P(200, "text/html", metricsPageHtml);
   });
 
-  server.on("/metricsHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
+server.on("/metricsHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
     uint64_t now = millis();
     const uint64_t ONE_DAY = 86400000;
     String json = "{";
@@ -3115,6 +3212,7 @@ json += "],";
       if (!firstNode) json += ",";
       firstNode = false;
       const auto &node = kv.second;
+      String nickname = getNodeNickname(node.nodeId);
       int bestRssi = node.history.empty() ? node.lastRSSI : node.history[0].rssi;
       float bestSnr = node.history.empty() ? node.lastSNR : node.history[0].snr;
       for (const auto &sample : node.history) {
@@ -3125,7 +3223,9 @@ json += "],";
           bestSnr = sample.snr;
         }
       }
-      json += "{\"nodeId\":\"" + node.nodeId + "\",\"bestRssi\":" + String(bestRssi)
+      json += "{\"nodeId\":\"" + node.nodeId + "\",";
+      json += "\"nickname\":\"" + nickname + "\",";
+      json += "\"bestRssi\":" + String(bestRssi)
            + ",\"bestSnr\":" + String(bestSnr, 2) + ",\"history\":[";
       bool firstSample = true;
       for (const auto &sample : node.history) {
@@ -3146,6 +3246,7 @@ json += "],";
     bool firstIndirect = true;
     for (auto const& kv : indirectNodes) {
       const auto &node = kv.second;
+      String nickname = getNodeNickname(node.originatorId);
       if (!firstIndirect) json += ",";
       firstIndirect = false;
       int bestRssi = node.history.empty() ? node.rssi : node.history[0].rssi;
@@ -3158,7 +3259,9 @@ json += "],";
           bestSnr = sample.snr;
         }
       }
-      json += "{\"nodeId\":\"" + node.originatorId + "\",\"relayId\":\"" + node.relayId + "\","; 
+      json += "{\"nodeId\":\"" + node.originatorId + "\",";
+      json += "\"nickname\":\"" + nickname + "\",";
+      json += "\"relayId\":\"" + node.relayId + "\",";
       json += "\"bestRssi\":" + String(bestRssi) + ",\"bestSnr\":" + String(bestSnr, 2) + ",\"history\":[";
       
       bool firstSample = true;
@@ -3177,7 +3280,7 @@ json += "],";
     }
     json += "]}";
     request->send(200, "application/json", json);
-  });
+});
 
   server.on("/txHistory", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send_P(200, "text/html", txHistoryPageHtml);
@@ -3200,7 +3303,7 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
   request->send(200, "application/json", json);
 });
 
-  server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request) {
+server.on("/loraDetails", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!request->hasParam("nodeId")) {
       String html =
         "<!DOCTYPE html><html lang='en'><head>"
@@ -3242,6 +3345,7 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
       request->send(200, "text/html", html);
     } else {
       String nodeId = request->getParam("nodeId")->value();
+      String nickname = getNodeNickname(nodeId); // <-- GET NICKNAME!
       LoRaNode *found = nullptr;
       if (loraNodes.find(nodeId) != loraNodes.end()) {
         found = &loraNodes[nodeId];
@@ -3272,7 +3376,12 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
         "<a href='/nodes'>Node List</a>"
         "<a href='/metrics'>RX History</a>"
         "</div>";
-      html += "<h2>LoRa Node: " + nodeId + "</h2>";
+      // ---------- TITLE: Node ID + Nickname ----------
+html += "<h2>LoRa Node: " + nodeId;
+if (nickname.length()) {
+  html += " <span style='color:#333; font-weight:normal; font-size:1em;'>(" + nickname + ")</span>";
+}
+html += "</h2>";
       if (!found) {
         html += "<div class='details'><p>No details available. This node hasn't been heard from or it's older than 24h.</p></div>";
         html += "</body></html>";
@@ -3312,13 +3421,23 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
         for (auto it = nodeMsgs.rbegin(); it != nodeMsgs.rend(); ++it) {
           uint64_t msgAgeMs = millis() - it->timeReceived;
           String msgAgeStr = formatRelativeTime(msgAgeMs);
+          // ------ MESSAGE: NodeID + Nickname ------
+          String thisNodeNickname = getNodeNickname(it->nodeId);
           html += "<div class='message-block'>";
-          html += "<h4>Sender: " + it->sender + " | NodeID: " + it->nodeId + "</h4>";
+html += "<h4>Sender: " + it->sender + " | NodeID: " + it->nodeId;
+if (thisNodeNickname.length()) {
+  html += " <span style='color:#007bff;font-size:0.9em;'>(" + thisNodeNickname + ")</span>";
+}
+html += "</h4>";
           html += "<p><strong>Content:</strong> " + it->content + "</p>";
           html += "<p><strong>Source:</strong> " + it->source + "</p>";
-          if (!it->relayID.isEmpty()) {
-            html += "<p><strong>RelayID:</strong> " + it->relayID + "</p>";
-          }
+if (!it->relayID.isEmpty()) {
+  html += "<p><strong>RelayID:</strong> " + it->relayID + "</p>";
+  String relayNickname = getNodeNickname(it->relayID);
+  if (relayNickname.length()) {
+    html += "<p style='margin:0 0 6px 0; color:#333; font-weight:normal; font-size:0.95em;'><strong>Nickname:</strong> " + relayNickname + "</p>";
+  }
+}
           html += "<p><em>" + msgAgeStr + "</em></p>";
           html += "</div>";
         }
@@ -3327,6 +3446,7 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
       request->send(200, "text/html", html);
     }
   });
+
 
     // --- Clients page: serves HTML ---
   server.on("/clients", HTTP_GET, [](AsyncWebServerRequest* request){
@@ -3347,6 +3467,69 @@ server.on("/txHistoryData", HTTP_GET, [](AsyncWebServerRequest* request) {
   json += "]}";
   request->send(200, "application/json", json);
   });
+
+// --- Nickname entry page ---
+server.on("/nickname", HTTP_GET, [](AsyncWebServerRequest *req) {
+    String nodeId = req->getParam("node")->value();
+    String nickname = getNodeNickname(nodeId);
+
+String html = "<!DOCTYPE html><html><head><title>Set Nickname</title>";
+html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+html += "<style>";
+html += "body{font-family:Arial;margin:0;min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;background:#f4f7f6;}";
+html += ".nickname-card{background:#fff;padding:32px 26px 20px 26px;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,0.13);min-width:270px;max-width:99vw;display:flex;flex-direction:column;align-items:center;}";
+html += "h2{margin:0 0 20px 0;color:#222;font-size:1.1em;text-align:center;font-weight:normal;}";
+html += "form{margin-top:8px;width:100%;display:flex;flex-direction:column;align-items:center;}";
+html += "label{font-weight:500;margin-bottom:7px;display:block;text-align:left;width:100%;}";
+html += "input{padding:7px;width:94%;font-size:1.1em;max-width:320px;margin-bottom:16px;border-radius:6px;border:1px solid #aaa;}";
+html += "button{margin-top:6px;padding:9px 30px;border-radius:6px;border:none;background:#007bff;color:white;font-size:1em;cursor:pointer;font-weight:bold;box-shadow:0 2px 4px rgba(0,0,0,0.06);}";
+html += "button:hover{background:#0056b3;}";
+html += "a{color:#007bff;text-decoration:none;font-weight:500;margin-top:12px;display:inline-block;}";
+html += "a:hover{text-decoration:underline;}";
+html += "</style>";
+html += "</head><body>";
+html += "<div class='nickname-card'>";
+html += "<h2>Add Nickname for " + nodeId + "</h2>";
+html += "<form method='POST' action='/nickname'>";
+html += "<input type='hidden' name='node' value='" + nodeId + "'>";
+html += "<label>Nickname (max 16 chars):<br>";
+html += "<input name='nickname' maxlength='15' value='" + nickname + "' autofocus></label>";
+html += "<button type='submit'>Save</button>";
+html += "</form>";
+html += "<a href='/nodes'>&larr; Back to Node List</a>";
+html += "</div></body></html>";
+    req->send(200, "text/html", html);
+});
+
+server.on("/nickname", HTTP_POST, [](AsyncWebServerRequest *req) {
+    String nodeId = req->getParam("node", true)->value();
+    String nickname = req->getParam("nickname", true)->value();
+    setNodeNickname(nodeId, nickname);
+    req->redirect("/nodes");  // ← This takes you to the main node list!
+});
+
+// ---- Example: Generating JSON API for Lifetime/Recent Nodes ----
+server.on("/api/nodes", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+
+    /* ---------- lifetime-recent LoRa nodes (with nicknames) ---------- */
+    json += "\"recentNodes\":[";
+    bool first = true;
+    for (const auto &id : getRecentNodes()) {
+        if (!first) json += ",";
+        first = false;
+        String nickname = getNodeNickname(id);
+        json += "{";
+        json += "\"id\":\"" + id + "\"";
+        json += ",\"nickname\":\"" + nickname + "\"";
+        json += "}";
+    }
+    json += "]";
+
+    json += "}"; // root object end
+
+    request->send(200, "application/json", json);
+});
 
   // —————————————————————————————————————————————————————————————————
 //  Battery status endpoint
