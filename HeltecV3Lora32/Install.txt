@@ -1,0 +1,21 @@
+You can use this website to flash Meshify to your Heltec Lora V3
+https://espressif.github.io/esptool-js/
+Dont forget to set the flash address for each file and erase device before flashing.
+
+0x0000   Meshmingle-Heltec_Lora_32_V3.ino.bootloader.bin   ***** its not the normal 0x1000 be aware!*****
+0x8000   Meshmingle-Heltec_Lora_32_V3.ino.partitions.bin
+0x10000  Meshmingle-Heltec_Lora_32_V3.ino.bin
+
+Please power off and on after flashing.
+How To Use:
+Power Up Then
+1. Connect to Wifi Hotspot called Meshmingle 1.0
+2. Open your browser and type mesh.local
+
+You should see a webpage load where you can send messages. that's it. 
+
+Note: This is set up to use EU868 Band
+
+Whats Fixed/New
+//Messages show time in 1 hour 1 min instead of 1 hour 2 hour.
+//Node History Now show time in 1 hour 1 min instead of 1 hour 2 hour.
