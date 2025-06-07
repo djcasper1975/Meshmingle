@@ -2236,7 +2236,7 @@ li.innerHTML = `
   </div>
   <div class="warning">For your safety, do not share your location or any personal information!</div>
   
-  <h2>Meshmingle Public Chat</h2>
+  <h2>Meshmingle Message Board</h2>
   
   <div id="deviceCount">Wifi Mesh Nodes: 0</div>
   
