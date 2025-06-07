@@ -6,7 +6,7 @@
 // M    M  EEEEE  SSSSS  H   H  M    M  I  N   N   GGG   LLLLL  EEEEE //
 ////////////////////////////////////////////////////////////////////////
 //
-//Test v1.00.038
+//Test v1.00.039
 //07-06-2025
 //
 //
@@ -37,6 +37,8 @@
 //indirect nodelist has nickname now.
 //removed bold from the nickname on recived messages.
 //carousel update we dont showe private messages we show nickname and how many messages there are.
+//removed relay id from recived messages for now.
+//moved relay id on messages senbt to above rssi snr.
 //
 
 //Uncomment to enable Heltec V3-specific logic or leave as is for Heltec V3.2 if your screen does not work uncommented your on V3.2 board
@@ -1954,9 +1956,10 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
     }
     .message-relayid {
       font-size: 0.7em;
-      color: #555;
-      margin-bottom: 2px;
+      color: #666;
       display: block;
+      text-align: right;
+      margin-bottom: 0;
     }
     .message-rssi-snr {
       font-size: 0.7em;
@@ -2134,52 +2137,55 @@ const char mainPageHtml[] PROGMEM = R"rawliteral(
             rssiSnrHtml = `<span class="message-rssi-snr">RSSI: ${msg.rssi} dBm, SNR: ${msg.snr} dB</span>`;
           }
 
+          // REMOVE relay display for received messages!
           let relayHtml = "";
-          if (!isSentByCurrentNode) {
-            relayHtml = `<span class="message-relayid">Relay Id: ${msg.relayID}</span>`;
+          let firstRelayLabel = "";
+          if (isSentByCurrentNode) {
+            // Only show for our own messages
+            if (msg.relayIDs && msg.relayIDs.length) {
+              firstRelayLabel = `<span class="first-relay">Relay: ${msg.relayIDs[0]}</span>`;
+            }
           }
-
-const firstRelayLabel =
-        (msg.relayIDs && msg.relayIDs.length)
-          ? `<span class="first-relay">Relay: ${msg.relayIDs[0]}</span>`
-          : '';
 
 li.innerHTML = `
   <span class="message-nodeid">${nodeIdHtml}</span>
   <div class="message-content">${senderHtml}${privateIndicator}${msg.content}</div>
-  ${firstRelayLabel}                     <!-- 3rd row ⬅️ -->
-  ${relayHtml}
   <span class="message-time">${timestamp}</span>
-  ${rssiSnrHtml}
+  ${
+    isSentByCurrentNode && msg.relayIDs && msg.relayIDs.length
+      ? `<div style="text-align:right;">
+            <span class="message-relayid">Relay: ${msg.relayIDs[0]}</span>
+         </div>`
+      : ''
+  }
+  ${
+    isSentByCurrentNode && msg.source === "[LoRa]" && msg.rssi !== undefined && msg.snr !== undefined
+      ? `<span class="message-rssi-snr" style="display:block;text-align:right;">RSSI: ${msg.rssi} dBm, SNR: ${msg.snr} dB</span>`
+      : ''
+  }
 `;
 
-if (isSentByCurrentNode) {
-  let indicator   = "";
-  const relays    = msg.relayIDs ? msg.relayIDs.length : 0;
-  const maxIcons  = 5;                         // ① hard cap
-  const shown     = Math.min(relays, maxIcons);
-  const leftover  = relays - shown;            // ② extra after the cap
+          if (isSentByCurrentNode) {
+            let indicator   = "";
+            const relays    = msg.relayIDs ? msg.relayIDs.length : 0;
+            const maxIcons  = 5;
+            const shown     = Math.min(relays, maxIcons);
+            const leftover  = relays - shown;
 
-  if (relays > 0) {
-    indicator += '<span class="circle">🟢</span>';
-    for (let i = 0; i < shown; i++) {          // ③ only up to five
-      indicator += '<span class="satellite">🛰️</span>';
-    }
-    if (leftover > 0) {                        // ④ add “(+n)”
-      indicator += `<span class="extra">(+${leftover})</span>`;
-    }
-  } else {
-    indicator = '<span class="circle">🔴</span><span class="keyboard">⌨️</span>';
-  }
+            if (relays > 0) {
+              indicator += '<span class="circle">🟢</span>';
+              for (let i = 0; i < shown; i++) {
+                indicator += '<span class="satellite">🛰️</span>';
+              }
+              if (leftover > 0) {
+                indicator += `<span class="extra">(+${leftover})</span>`;
+              }
+            } else {
+              indicator = '<span class="circle">🔴</span><span class="keyboard">⌨️</span>';
+            }
 
-/*  ▼ NEW: show this line only if it’s one of *our* messages         */
-const firstRelayLabel =
-      (isSentByCurrentNode && msg.relayIDs && msg.relayIDs.length)
-        ? `<span class="first-relay">Relay: ${msg.relayIDs[0]}</span>`
-        : '';
-
-  li.innerHTML += `<span class="relay-status">${indicator}</span>`;
-}
+            li.innerHTML += `<span class="relay-status">${indicator}</span>`;
+          }
           ul.appendChild(li);
         });
 
@@ -2206,23 +2212,23 @@ const firstRelayLabel =
     setInterval(fetchData, 5000);
     document.getElementById('messageForm').addEventListener('submit', sendMessage);
   };
-// ——————————————————————————————  
-// Poll the battery endpoint every 60 s
-// ——————————————————————————————
-function updateBattery() {
-  fetch('/battery')
-    .then(r => r.json())
-    .then(data => {
-      document.getElementById('batVolt').textContent = data.voltage.toFixed(3);
-      document.getElementById('batPct').textContent = data.percentage;
-    })
-    .catch(console.error);
-}
-setInterval(updateBattery, 60000);
-updateBattery();  // fire on load
-
+  // ——————————————————————————————  
+  // Poll the battery endpoint every 60 s
+  // ——————————————————————————————
+  function updateBattery() {
+    fetch('/battery')
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('batVolt').textContent = data.voltage.toFixed(3);
+        document.getElementById('batPct').textContent = data.percentage;
+      })
+      .catch(console.error);
+  }
+  setInterval(updateBattery, 60000);
+  updateBattery();  // fire on load
 
 </script>
+
 </head>
 <body>
   <div id="batteryStatus" style="margin:10px; font-size:0.9em; color:#333;">
